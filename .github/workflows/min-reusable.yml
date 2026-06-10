@@ -5,8 +5,17 @@ on:
       lane:
         required: true
         type: string
+    secrets:
+      GH_PAT:
+        required: true
+permissions:
+  contents: read
+  actions: read
 jobs:
   ping:
     runs-on: ubuntu-latest
+    concurrency:
+      group: brain-sync-${{ inputs.lane }}
+      cancel-in-progress: false
     steps:
-      - run: echo "reusable ok lane=${{ inputs.lane }}"
+      - run: echo "lane=${{ inputs.lane }} has_secret=${{ secrets.GH_PAT != '' }}"
