@@ -5,9 +5,6 @@ on:
       lane:
         required: true
         type: string
-    secrets:
-      GH_PAT:
-        required: true
 permissions:
   contents: read
   actions: read
@@ -15,4 +12,4 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "lane=${{ inputs.lane }} has_secret=${{ secrets.GH_PAT != '' }}"
+      - run: echo "lane=${{ inputs.lane }}"
