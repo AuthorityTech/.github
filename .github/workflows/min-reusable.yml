@@ -14,8 +14,5 @@ permissions:
 jobs:
   ping:
     runs-on: ubuntu-latest
-    concurrency:
-      group: brain-sync-${{ inputs.lane }}
-      cancel-in-progress: false
     steps:
       - run: echo "lane=${{ inputs.lane }} has_secret=${{ secrets.GH_PAT != '' }}"
