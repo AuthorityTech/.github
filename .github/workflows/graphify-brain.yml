@@ -100,6 +100,12 @@ jobs:
           print('Pipeline complete.')
           "
 
+      - name: Write repo file manifest
+        if: hashFiles('graphify-out/graph.json') != ''
+        # Full file inventory at HEAD (code AND content). Gate-1 grounds citations
+        # against this, so lessons about published content stop quarantining.
+        run: git ls-files > graphify-out/files.txt
+
       - name: Upload graph artifact
         if: hashFiles('graphify-out/graph.json') != ''
         uses: actions/upload-artifact@v4
