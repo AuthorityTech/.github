@@ -1,0 +1,12 @@
+name: Min Reusable
+on:
+  workflow_call:
+    inputs:
+      lane:
+        required: true
+        type: string
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "reusable ok lane=${{ inputs.lane }}"
