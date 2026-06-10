@@ -1,0 +1,142 @@
+name: Brain Sync (Reusable)
+
+# Canonical reusable brain-sync workflow for the AuthorityTech fleet.
+# Source repos call this with `uses: AuthorityTech/.github/.github/workflows/graphify-brain.yml@main`.
+# One definition, one token (org-level GH_PAT inherited), zero per-repo drift.
+
+on:
+  workflow_call:
+    inputs:
+      lane:
+        description: Brain lane directory (for example website, at-app, paralax)
+        required: true
+        type: string
+    secrets:
+      GH_PAT:
+        description: Token authorized to repository_dispatch AuthorityTech/brain
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: brain-sync-${{ inputs.lane }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install graphifyy
+        run: pip install 'graphifyy==0.8.24'
+
+      - name: Run graphify pipeline
+        run: |
+          python3 -c "
+          import json
+          from pathlib import Path
+          from graphify.detect import detect
+          from graphify.extract import collect_files, extract
+          from graphify.build import build
+          from graphify.cluster import cluster, score_all
+          from graphify.analyze import god_nodes, surprising_connections
+          from graphify.export import to_json
+          from graphify.report import generate
+          from graphify.wiki import to_wiki
+
+          root = Path('.')
+          detection = detect(root)
+          print(f'Detected: {detection[\"total_files\"]} files')
+
+          code_files_raw = detection.get('files', {}).get('code', [])
+          if not code_files_raw:
+              print('No code files found - skipping.')
+              raise SystemExit(0)
+
+          code_files = []
+          for f in code_files_raw:
+              p = Path(f)
+              code_files.extend(collect_files(p) if p.is_dir() else [p])
+
+          ast_result = extract(code_files)
+          print(f'AST: {len(ast_result[\"nodes\"])} nodes, {len(ast_result[\"edges\"])} edges')
+
+          G = build([ast_result])
+          communities = cluster(G)
+          cohesion = score_all(G, communities)
+          labels = {cid: f'Community {cid}' for cid in communities}
+          print(f'Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges, {len(communities)} communities')
+
+          gods = god_nodes(G)
+          surprises = surprising_connections(G, communities)
+
+          out = Path('graphify-out')
+          out.mkdir(exist_ok=True)
+          to_json(G, communities, str(out / 'graph.json'))
+
+          report_md = generate(
+              G=G, communities=communities, cohesion_scores=cohesion,
+              community_labels=labels, god_node_list=gods,
+              surprise_list=surprises, detection_result=detection,
+              token_cost={'input_tokens': 0, 'output_tokens': 0},
+              root=str(root),
+          )
+          (out / 'GRAPH_REPORT.md').write_text(report_md)
+
+          wiki_count = to_wiki(
+              G, communities, str(out / 'wiki'),
+              community_labels=labels, cohesion=cohesion,
+              god_nodes_data=gods,
+          )
+          print(f'Wiki: {wiki_count} articles')
+          print('Pipeline complete.')
+          "
+
+      - name: Upload graph artifact
+        if: hashFiles('graphify-out/graph.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: brain-sync-${{ inputs.lane }}-${{ github.sha }}
+          path: graphify-out
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Dispatch queued brain sync
+        if: hashFiles('graphify-out/graph.json') != ''
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          LANE: ${{ inputs.lane }}
+          ARTIFACT_NAME: brain-sync-${{ inputs.lane }}-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          : "${GH_PAT:?missing GH_PAT secret}"
+          : "${LANE:?missing lane input}"
+
+          dispatched_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          payload="$(jq -n \
+            --arg source_repo "$GITHUB_REPOSITORY" \
+            --arg source_sha "$GITHUB_SHA" \
+            --arg lane "$LANE" \
+            --arg source_run_id "$GITHUB_RUN_ID" \
+            --arg artifact_name "$ARTIFACT_NAME" \
+            --arg dispatched_at "$dispatched_at" \
+            '{event_type:"brain-sync", client_payload:{source_repo:$source_repo, source_sha:$source_sha, lane:$lane, source_run_id:$source_run_id, artifact_name:$artifact_name, dispatched_at:$dispatched_at}}')"
+
+          curl --fail --show-error --silent --output /dev/null \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/AuthorityTech/brain/dispatches \
+            -d "$payload"
+
+          echo "Dispatched queued brain sync for ${GITHUB_REPOSITORY}@${GITHUB_SHA::7} lane ${LANE}."
