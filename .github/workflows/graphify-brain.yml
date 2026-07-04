@@ -50,7 +50,6 @@ jobs:
           from graphify.analyze import god_nodes, surprising_connections
           from graphify.export import to_json
           from graphify.report import generate
-          from graphify.wiki import to_wiki
 
           root = Path('.')
           detection = detect(root)
@@ -90,13 +89,7 @@ jobs:
               root=str(root),
           )
           (out / 'GRAPH_REPORT.md').write_text(report_md)
-
-          wiki_count = to_wiki(
-              G, communities, str(out / 'wiki'),
-              community_labels=labels, cohesion=cohesion,
-              god_nodes_data=gods,
-          )
-          print(f'Wiki: {wiki_count} articles')
+          # Lane wikis are DEAD (founder ruling R4, 2026-07-04): zero consumers.
           print('Pipeline complete.')
           "
 
