@@ -1,0 +1,58 @@
+name: Site Integrity (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node version for site validation.
+        required: false
+        type: string
+        default: "20"
+      install-command:
+        description: Dependency install command. Leave empty to skip.
+        required: false
+        type: string
+        default: "npm ci"
+      internal-links-config:
+        description: Internal links config path relative to repo root. Leave empty to skip.
+        required: false
+        type: string
+        default: "internal-links.config.json"
+      schema-command:
+        description: Optional shell command block for site-specific schema/build validation.
+        required: false
+        type: string
+        default: ""
+      extra-commands:
+        description: Optional shell command block for additional site-specific checks.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  site-integrity:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: site-integrity-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout site repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Run shared site integrity checks
+        uses: AuthorityTech/.github/.github/actions/site-integrity@main
+        with:
+          install-command: ${{ inputs.install-command }}
+          internal-links-config: ${{ inputs.internal-links-config }}
+          schema-command: ${{ inputs.schema-command }}
+          extra-commands: ${{ inputs.extra-commands }}

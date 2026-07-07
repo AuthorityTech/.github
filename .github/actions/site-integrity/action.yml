@@ -1,0 +1,75 @@
+name: Site Integrity
+description: Shared AuthorityTech site integrity checks for content and schema gates.
+
+inputs:
+  working-directory:
+    description: Directory containing the checked out site repo.
+    required: false
+    default: "."
+  install-command:
+    description: Dependency install command. Leave empty to skip.
+    required: false
+    default: "npm ci"
+  internal-links-config:
+    description: Internal links config path relative to working-directory. Leave empty to skip.
+    required: false
+    default: "internal-links.config.json"
+  schema-command:
+    description: Optional shell command block for site-specific schema/build validation.
+    required: false
+    default: ""
+  extra-commands:
+    description: Optional shell command block for additional site-specific checks.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install dependencies
+      if: ${{ inputs.install-command != '' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SITE_INTEGRITY_INSTALL_COMMAND: ${{ inputs.install-command }}
+      run: |
+        set -euo pipefail
+        printf '%s\n' "$SITE_INTEGRITY_INSTALL_COMMAND" > "$RUNNER_TEMP/site-integrity-install.sh"
+        bash "$RUNNER_TEMP/site-integrity-install.sh"
+
+    - name: Validate internal links
+      if: ${{ inputs.internal-links-config != '' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SITE_INTEGRITY_INTERNAL_LINKS_CONFIG: ${{ inputs.internal-links-config }}
+      run: |
+        set -euo pipefail
+        if [ "$SITE_INTEGRITY_INTERNAL_LINKS_CONFIG" != "internal-links.config.json" ]; then
+          echo "site-integrity currently expects internal-links.config.json at the site root."
+          exit 1
+        fi
+        test -f "$SITE_INTEGRITY_INTERNAL_LINKS_CONFIG"
+        node "$GITHUB_ACTION_PATH/validate-internal-links.mjs"
+
+    - name: Run schema command
+      if: ${{ inputs.schema-command != '' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SITE_INTEGRITY_SCHEMA_COMMAND: ${{ inputs.schema-command }}
+      run: |
+        set -euo pipefail
+        printf '%s\n' "$SITE_INTEGRITY_SCHEMA_COMMAND" > "$RUNNER_TEMP/site-integrity-schema.sh"
+        bash "$RUNNER_TEMP/site-integrity-schema.sh"
+
+    - name: Run extra commands
+      if: ${{ inputs.extra-commands != '' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SITE_INTEGRITY_EXTRA_COMMANDS: ${{ inputs.extra-commands }}
+      run: |
+        set -euo pipefail
+        printf '%s\n' "$SITE_INTEGRITY_EXTRA_COMMANDS" > "$RUNNER_TEMP/site-integrity-extra.sh"
+        bash "$RUNNER_TEMP/site-integrity-extra.sh"
