@@ -23,6 +23,18 @@ on:
         required: false
         type: string
         default: ""
+      internal-links-paths:
+        description: Newline-separated path globs that should run internal link validation.
+        required: false
+        type: string
+        default: |
+          content/**
+          internal-links.config.json
+      schema-paths:
+        description: Newline-separated path globs that should run schema/build validation.
+        required: false
+        type: string
+        default: ""
       extra-commands:
         description: Optional shell command block for additional site-specific checks.
         required: false
@@ -33,26 +45,116 @@ permissions:
   contents: read
 
 jobs:
-  site-integrity:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      internal_links: ${{ steps.detect.outputs.internal_links }}
+      schema: ${{ steps.detect.outputs.schema }}
+
+    steps:
+      - name: Checkout site repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: detect
+        shell: bash
+        env:
+          INTERNAL_LINKS_PATHS: ${{ inputs.internal-links-paths }}
+          SCHEMA_PATHS: ${{ inputs.schema-paths }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" && -n "${GITHUB_BASE_REF:-}" ]]; then
+            git fetch origin "${GITHUB_BASE_REF}" --depth=1
+            git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD" > "$RUNNER_TEMP/site-integrity-files.txt"
+          elif [[ -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
+            git diff --name-only "${{ github.event.before }}" "${GITHUB_SHA}" > "$RUNNER_TEMP/site-integrity-files.txt" || git show --name-only --pretty= "${GITHUB_SHA}" > "$RUNNER_TEMP/site-integrity-files.txt"
+          else
+            git show --name-only --pretty= "${GITHUB_SHA}" > "$RUNNER_TEMP/site-integrity-files.txt"
+          fi
+
+          node <<'NODE'
+          const fs = require('node:fs');
+          const out = process.env.GITHUB_OUTPUT;
+          const files = fs.readFileSync(`${process.env.RUNNER_TEMP}/site-integrity-files.txt`, 'utf8')
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean);
+
+          function patterns(name) {
+            return (process.env[name] || '')
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter(Boolean);
+          }
+
+          function globToRegex(glob) {
+            let source = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+            source = source.replace(/\*\*/g, '.*').replace(/\*/g, '[^/]*');
+            return new RegExp(`^${source}$`);
+          }
+
+          function matches(patternList) {
+            if (!files.length) return true;
+            if (!patternList.length) return false;
+            const regexes = patternList.map(globToRegex);
+            return files.some((file) => regexes.some((regex) => regex.test(file)));
+          }
+
+          fs.appendFileSync(out, `internal_links=${matches(patterns('INTERNAL_LINKS_PATHS'))}\n`);
+          fs.appendFileSync(out, `schema=${matches(patterns('SCHEMA_PATHS'))}\n`);
+          NODE
+
+  internal-links:
+    needs: changes
+    if: ${{ inputs.internal-links-config != '' && needs.changes.outputs.internal_links == 'true' }}
     runs-on: ubuntu-latest
     concurrency:
-      group: site-integrity-${{ github.repository }}-${{ github.ref }}
+      group: site-integrity-links-${{ github.repository }}-${{ github.ref }}
       cancel-in-progress: true
 
     steps:
       - name: Checkout site repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
 
-      - name: Run shared site integrity checks
+      - name: Run shared internal link checks
+        uses: AuthorityTech/.github/.github/actions/site-integrity@main
+        with:
+          install-command: ""
+          internal-links-config: ${{ inputs.internal-links-config }}
+          schema-command: ""
+          extra-commands: ""
+
+  schema:
+    needs: changes
+    if: ${{ inputs.schema-command != '' && needs.changes.outputs.schema == 'true' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: site-integrity-schema-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout site repo
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Run shared schema checks
         uses: AuthorityTech/.github/.github/actions/site-integrity@main
         with:
           install-command: ${{ inputs.install-command }}
-          internal-links-config: ${{ inputs.internal-links-config }}
+          internal-links-config: ""
           schema-command: ${{ inputs.schema-command }}
           extra-commands: ${{ inputs.extra-commands }}
