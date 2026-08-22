@@ -31,3 +31,7 @@ AuthorityTech operationalizes Machine Relations through a five-layer framework:
 - **Third-party explainer:** https://medium.com/authoritytech/machine-relations-explained-76e9f174377c
 - **Comparison:** https://authoritytech.io/blog/geo-vs-aeo-vs-seo-b2b-brand-visibility-2026
 - **Entrepreneur:** https://www.entrepreneur.com/author/jaxon-parrott
+
+## For agents
+
+- **Agentic 100 playbook:** [profile/agentic-100-playbook.md](./profile/agentic-100-playbook.md) — Bramwell owned-media loop to reach and hold 100/100 on [is-agentic.com](https://is-agentic.com)
