@@ -63,16 +63,50 @@ jobs:
         env:
           INTERNAL_LINKS_PATHS: ${{ inputs.internal-links-paths }}
           SCHEMA_PATHS: ${{ inputs.schema-paths }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
 
+          FILES="$RUNNER_TEMP/site-integrity-files.txt"
+          : > "$FILES"
+
           if [[ "${GITHUB_EVENT_NAME}" == "pull_request" && -n "${GITHUB_BASE_REF:-}" ]]; then
-            git fetch origin "${GITHUB_BASE_REF}" --depth=1
-            git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD" > "$RUNNER_TEMP/site-integrity-files.txt"
-          elif [[ -n "${{ github.event.before }}" && "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]]; then
-            git diff --name-only "${{ github.event.before }}" "${GITHUB_SHA}" > "$RUNNER_TEMP/site-integrity-files.txt" || git show --name-only --pretty= "${GITHUB_SHA}" > "$RUNNER_TEMP/site-integrity-files.txt"
+            # Never fetch the base ref with --depth. actions/checkout above made a
+            # complete clone (fetch-depth: 0), and a shallow fetch into a complete
+            # clone re-grafts it: git writes .git/shallow, the base branch loses its
+            # ancestry, and "origin/<base>...HEAD" dies with "no merge base" whenever
+            # the PR branch is behind a base branch that has moved. On these repos an
+            # automated publisher writes the base branch every few minutes, so that
+            # race fired constantly and made the dependent jobs skip.
+            git fetch --no-tags --force origin \
+              "+refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+
+            # Prefer the base SHA carried by the event: it is the base as it stood
+            # when the run was queued, so it cannot drift mid-run.
+            BASE_REF_NAME="origin/${GITHUB_BASE_REF}"
+            BASE="${PR_BASE_SHA:-}"
+            if [[ -z "$BASE" ]] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+              BASE="$BASE_REF_NAME"
+            fi
+
+            MERGE_BASE="$(git merge-base "$BASE" HEAD 2>/dev/null || true)"
+            if [[ -z "$MERGE_BASE" && "$BASE" != "$BASE_REF_NAME" ]]; then
+              MERGE_BASE="$(git merge-base "$BASE_REF_NAME" HEAD 2>/dev/null || true)"
+            fi
+
+            if [[ -n "$MERGE_BASE" ]]; then
+              git diff --name-only "$MERGE_BASE" HEAD > "$FILES"
+            else
+              # Fail safe, not silent: an undetermined change set must widen coverage,
+              # never remove it. An empty list makes every gated job run.
+              echo "::warning::site-integrity: could not resolve a merge base against ${GITHUB_BASE_REF}; running all gated checks."
+              : > "$FILES"
+            fi
+          elif [[ -n "${PUSH_BEFORE_SHA:-}" && "${PUSH_BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            git diff --name-only "${PUSH_BEFORE_SHA}" "${GITHUB_SHA}" > "$FILES" || git show --name-only --pretty= "${GITHUB_SHA}" > "$FILES"
           else
-            git show --name-only --pretty= "${GITHUB_SHA}" > "$RUNNER_TEMP/site-integrity-files.txt"
+            git show --name-only --pretty= "${GITHUB_SHA}" > "$FILES"
           fi
 
           node <<'NODE'
