@@ -95,6 +95,8 @@ jobs:
               MERGE_BASE="$(git merge-base "$BASE_REF_NAME" HEAD 2>/dev/null || true)"
             fi
 
+            echo "site-integrity: event=pull_request base_ref=${GITHUB_BASE_REF} base=${BASE} merge_base=${MERGE_BASE:-<none>}"
+
             if [[ -n "$MERGE_BASE" ]]; then
               git diff --name-only "$MERGE_BASE" HEAD > "$FILES"
             else
@@ -124,10 +126,36 @@ jobs:
               .filter(Boolean);
           }
 
+          // Translate one glob in a SINGLE pass. Two sequential passes are wrong:
+          // `**` -> `.*` followed by `*` -> `[^/]*` rewrites the `*` the first pass
+          // just emitted, so `content/**` compiled to `^content/.[^/]*$` — one
+          // directory level, never nested. Every content file we ship sits two
+          // levels deep (content/<lane>/<slug>.md), so every `**` gate silently
+          // reported false and its job reported `skipped` while reading as green.
           function globToRegex(glob) {
-            let source = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-            source = source.replace(/\*\*/g, '.*').replace(/\*/g, '[^/]*');
+            const source = glob
+              .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+              .replace(/\*\*|\*/g, (token) => (token === '**' ? '.*' : '[^/]*'));
             return new RegExp(`^${source}$`);
+          }
+
+          // Regression lock, inline because this compiler has exactly one copy and
+          // no test file can travel with it. A broken compiler must fail the run
+          // loudly, never gate the jobs dark.
+          for (const [glob, path] of [
+            ['content/**', 'content/glossary/answer-engine-optimization.md'],
+            ['packages/**', 'packages/schema/src/index.ts'],
+            ['src/app/blog/**/page.tsx', 'src/app/blog/[slug]/page.tsx'],
+            ['content/*.md', 'content/index.md'],
+          ]) {
+            if (!globToRegex(glob).test(path)) {
+              console.error(`site-integrity: glob compiler is broken: ${glob} did not match ${path}`);
+              process.exit(1);
+            }
+          }
+          if (globToRegex('content/*.md').test('content/a/b.md')) {
+            console.error('site-integrity: glob compiler is broken: single * crossed a /');
+            process.exit(1);
           }
 
           function matches(patternList) {
@@ -137,8 +165,18 @@ jobs:
             return files.some((file) => regexes.some((regex) => regex.test(file)));
           }
 
-          fs.appendFileSync(out, `internal_links=${matches(patterns('INTERNAL_LINKS_PATHS'))}\n`);
-          fs.appendFileSync(out, `schema=${matches(patterns('SCHEMA_PATHS'))}\n`);
+          const internalLinks = matches(patterns('INTERNAL_LINKS_PATHS'));
+          const schema = matches(patterns('SCHEMA_PATHS'));
+
+          // Say what was seen. Without this the only readable symptom of a mis-gate
+          // is a job reporting `skipped`, which reads like a queue state.
+          console.log(`site-integrity: ${files.length} changed file(s) in scope`);
+          console.log(files.slice(0, 50).map((file) => `  ${file}`).join('\n'));
+          if (files.length > 50) console.log(`  ... and ${files.length - 50} more`);
+          console.log(`site-integrity: internal_links=${internalLinks} schema=${schema}`);
+
+          fs.appendFileSync(out, `internal_links=${internalLinks}\n`);
+          fs.appendFileSync(out, `schema=${schema}\n`);
           NODE
 
   internal-links:
