@@ -1,7 +1,8 @@
 name: Dependabot Auto-merge (Reusable)
 
 # Merges a Dependabot patch or minor update once every other status and check on
-# its exact head commit has passed. The sites deploy from main and have no
+# its exact head commit has passed and no package.json range it changes crosses a
+# major. The sites deploy from main and have no
 # required checks for GitHub auto-merge to wait on (seats push to main
 # directly), so the gate lives here: the Vercel production build, the site's own
 # guards and its Actions checks must all be green on the head being merged.
@@ -69,10 +70,33 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WAIT_MINUTES: ${{ inputs.wait-minutes }}
         run: |
           set -euo pipefail
+          # Dependabot can raise a declared range across a major inside a
+          # patch/minor group to satisfy a nested pin (next ^15 -> ^16 so postcss
+          # can move) while the metadata lists only the patch/minor updates. Hold
+          # the PR if any package.json it changes crosses a major (or a 0.x minor).
+          files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
+            --jq '.[] | select(.filename | test("(^|/)package\\.json$")) | .filename')
+          for f in $files; do
+            gh api "repos/$REPO/contents/$f?ref=$BASE_SHA" --jq .content | base64 -d > "$RUNNER_TEMP/base.json"
+            gh api "repos/$REPO/contents/$f?ref=$SHA" --jq .content | base64 -d > "$RUNNER_TEMP/head.json"
+            if ! crossed=$(node -e '
+              const fs = require("fs");
+              const [a, b] = process.argv.slice(-2).map((p) => JSON.parse(fs.readFileSync(p, "utf8")));
+              const major = (v) => { const m = String(v).match(/(\d+)(?:\.(\d+))?/); return m ? (m[1] === "0" ? "0." + (m[2] ?? "") : m[1]) : String(v); };
+              const crossed = [];
+              for (const s of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"])
+                for (const [n, v] of Object.entries(b[s] || {})) { const o = (a[s] || {})[n]; if (o !== undefined && o !== v && major(o) !== major(v)) crossed.push(n + " " + o + " -> " + v); }
+              if (crossed.length) { console.log(crossed.join("; ")); process.exit(1); }
+            ' "$RUNNER_TEMP/base.json" "$RUNNER_TEMP/head.json"); then
+              echo "::notice::Not merging #$PR: $f crosses a major ($crossed)."
+              exit 0
+            fi
+          done
           # The calling workflow's path, e.g. .github/workflows/dependabot-automerge.yml.
           caller="${WORKFLOW_REF#"$REPO/"}"
           caller="${caller%%@*}"
