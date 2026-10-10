@@ -15,6 +15,7 @@ name: Dependabot Auto-merge (Reusable)
 #   permissions:
 #     contents: write
 #     pull-requests: write
+#     actions: read
 #     checks: read
 #     statuses: read
 #   jobs:
@@ -34,8 +35,9 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  # Read the head commit's build status and check runs; an explicit permissions
-  # block grants nothing it does not name.
+  # Read the head commit's build status, check runs and this gate's own runs; an
+  # explicit permissions block grants nothing it does not name.
+  actions: read
   checks: read
   statuses: read
 
