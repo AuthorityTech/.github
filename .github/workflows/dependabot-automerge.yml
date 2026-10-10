@@ -1,14 +1,15 @@
 name: Dependabot Auto-merge (Reusable)
 
-# Merges a Dependabot patch or minor update once every other status and check on
-# its exact head commit has passed and no package.json range it changes crosses a
-# major. The sites deploy from main and have no
-# required checks for GitHub auto-merge to wait on (seats push to main
-# directly), so the gate lives here: the Vercel production build, the site's own
-# guards and its Actions checks must all be green on the head being merged.
+# Merges a Dependabot patch or minor update, grouped or single, once every other
+# status and check on its exact head commit has passed and nothing it changes in
+# package.json or package-lock.json crosses a major. The sites deploy from main
+# and have no required checks for GitHub auto-merge to wait on (seats push to
+# main directly), so the gate lives here: the Vercel production build, the site's
+# own guards and its Actions checks must all be green on the head being merged.
 #
 # Call it from a pull_request_target workflow. It never checks out or executes
-# pull-request code; it reads Dependabot metadata and commit statuses only.
+# pull-request code; it reads Dependabot metadata, file contents through the API
+# and commit statuses only.
 #
 #   on:
 #     pull_request_target:
@@ -62,41 +63,51 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Merge patch and minor updates once the head commit is green
-        if: >-
-          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
-          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           SHA: ${{ github.event.pull_request.head.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WAIT_MINUTES: ${{ inputs.wait-minutes }}
         run: |
           set -euo pipefail
-          # Dependabot can raise a declared range across a major inside a
-          # patch/minor group to satisfy a nested pin (next ^15 -> ^16 so postcss
-          # can move) while the metadata lists only the patch/minor updates. Hold
-          # the PR if any package.json it changes crosses a major (or a 0.x minor).
+          # The metadata alone cannot be trusted either way. Security updates
+          # carry no update-type, so any PR that moves more than one version
+          # (every grouped PR) reads as empty. And a patch/minor group can still
+          # raise a declared range across a major to free a nested pin (next ^15
+          # -> ^16 so postcss can move) without listing it. Decide from the files:
+          # hold if any package.json range or package-lock.json entry crosses a
+          # major (or a 0.x minor), and hold an untyped PR with no lockfile.
           files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate \
-            --jq '.[] | select(.filename | test("(^|/)package\\.json$")) | .filename')
+            --jq '.[] | select(.filename | test("(^|/)package(-lock)?\\.json$")) | .filename')
+          locks=0
           for f in $files; do
-            gh api "repos/$REPO/contents/$f?ref=$BASE_SHA" --jq .content | base64 -d > "$RUNNER_TEMP/base.json"
-            gh api "repos/$REPO/contents/$f?ref=$SHA" --jq .content | base64 -d > "$RUNNER_TEMP/head.json"
+            [[ $f == *package-lock.json ]] && locks=$((locks + 1))
+            gh api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/$f?ref=$BASE_SHA" > "$RUNNER_TEMP/base.json"
+            gh api -H "Accept: application/vnd.github.raw" "repos/$REPO/contents/$f?ref=$SHA" > "$RUNNER_TEMP/head.json"
             if ! crossed=$(node -e '
               const fs = require("fs");
               const [a, b] = process.argv.slice(-2).map((p) => JSON.parse(fs.readFileSync(p, "utf8")));
               const major = (v) => { const m = String(v).match(/(\d+)(?:\.(\d+))?/); return m ? (m[1] === "0" ? "0." + (m[2] ?? "") : m[1]) : String(v); };
               const crossed = [];
+              const check = (name, o, v) => { if (typeof o === "string" && typeof v === "string" && o !== v && major(o) !== major(v)) crossed.push(name + " " + o + " -> " + v); };
               for (const s of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"])
-                for (const [n, v] of Object.entries(b[s] || {})) { const o = (a[s] || {})[n]; if (o !== undefined && o !== v && major(o) !== major(v)) crossed.push(n + " " + o + " -> " + v); }
-              if (crossed.length) { console.log(crossed.join("; ")); process.exit(1); }
+                for (const [n, v] of Object.entries(b[s] || {})) check(n, (a[s] || {})[n], v);
+              for (const [p, e] of Object.entries(b.packages || {})) if (p) check(p, ((a.packages || {})[p] || {}).version, e.version);
+              if (crossed.length) { console.log(crossed.slice(0, 5).join("; ")); process.exit(1); }
             ' "$RUNNER_TEMP/base.json" "$RUNNER_TEMP/head.json"); then
               echo "::notice::Not merging #$PR: $f crosses a major ($crossed)."
               exit 0
             fi
           done
+          if [[ ( -z $UPDATE_TYPE || $UPDATE_TYPE == null ) && $locks -eq 0 ]]; then
+            echo "::notice::Not merging #$PR: no update type, and no package-lock.json to read one from."
+            exit 0
+          fi
           # The calling workflow's path, e.g. .github/workflows/dependabot-automerge.yml.
           caller="${WORKFLOW_REF#"$REPO/"}"
           caller="${caller%%@*}"
