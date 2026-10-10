@@ -15,6 +15,8 @@ name: Dependabot Auto-merge (Reusable)
 #   permissions:
 #     contents: write
 #     pull-requests: write
+#     checks: read
+#     statuses: read
 #   jobs:
 #     automerge:
 #       if: github.event.pull_request.user.login == 'dependabot[bot]'
@@ -32,6 +34,10 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # Read the head commit's build status and check runs; an explicit permissions
+  # block grants nothing it does not name.
+  checks: read
+  statuses: read
 
 jobs:
   merge:
@@ -61,18 +67,25 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           SHA: ${{ github.event.pull_request.head.sha }}
-          RUN_ID: ${{ github.run_id }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
           WAIT_MINUTES: ${{ inputs.wait-minutes }}
         run: |
           set -euo pipefail
+          # The calling workflow's path, e.g. .github/workflows/dependabot-automerge.yml.
+          caller="${WORKFLOW_REF#"$REPO/"}"
+          caller="${caller%%@*}"
           deadline=$((SECONDS + WAIT_MINUTES * 60))
           while :; do
             # Commit statuses: Vercel reports the production build here. At least
             # one must exist, so a repo or PR with no build never merges blind.
             statuses=$(gh api "repos/$REPO/commits/$SHA/status" --jq '[.statuses[].state]')
-            # Check runs, excluding this run's own job.
+            # Check runs, excluding every run of this gate on the same head (this
+            # one, and earlier or cancelled ones), so the gate never waits on or
+            # vetoes itself.
+            own=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" \
+              --jq "[.workflow_runs[] | select(.path == \"$caller\") | .check_suite_id]")
             checks=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
-              --jq "[.check_runs[] | select((.details_url // \"\") | contains(\"/runs/$RUN_ID/\") | not) | (.conclusion // \"pending\")]")
+              --jq "[.check_runs[] | select(.check_suite.id as \$s | $own | index(\$s) | not) | (.conclusion // \"pending\")]")
             echo "statuses=$statuses checks=$checks"
             if jq -e 'any(.[]; . == "failure" or . == "error")' <<<"$statuses" >/dev/null ||
                jq -e 'any(.[]; . == "failure" or . == "cancelled" or . == "timed_out" or . == "action_required" or . == "startup_failure")' <<<"$checks" >/dev/null; then
