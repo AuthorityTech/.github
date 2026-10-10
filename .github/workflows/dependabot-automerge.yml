@@ -1,0 +1,92 @@
+name: Dependabot Auto-merge (Reusable)
+
+# Merges a Dependabot patch or minor update once every other status and check on
+# its exact head commit has passed. The sites deploy from main and have no
+# required checks for GitHub auto-merge to wait on (seats push to main
+# directly), so the gate lives here: the Vercel production build, the site's own
+# guards and its Actions checks must all be green on the head being merged.
+#
+# Call it from a pull_request_target workflow. It never checks out or executes
+# pull-request code; it reads Dependabot metadata and commit statuses only.
+#
+#   on:
+#     pull_request_target:
+#       types: [opened, synchronize, reopened, ready_for_review]
+#   permissions:
+#     contents: write
+#     pull-requests: write
+#   jobs:
+#     automerge:
+#       if: github.event.pull_request.user.login == 'dependabot[bot]'
+#       uses: AuthorityTech/.github/.github/workflows/dependabot-automerge.yml@main
+
+on:
+  workflow_call:
+    inputs:
+      wait-minutes:
+        description: How long to wait for the head commit's checks before leaving the PR for a later event.
+        required: false
+        type: number
+        default: 40
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    # A newer push to the same PR supersedes the wait on the old head.
+    concurrency:
+      group: dependabot-automerge-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Read Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@d7267f607e9d3fb96fc2fbe83e0af444713e90b7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge patch and minor updates once the head commit is green
+        if: >-
+          steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+          steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
+          WAIT_MINUTES: ${{ inputs.wait-minutes }}
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + WAIT_MINUTES * 60))
+          while :; do
+            # Commit statuses: Vercel reports the production build here. At least
+            # one must exist, so a repo or PR with no build never merges blind.
+            statuses=$(gh api "repos/$REPO/commits/$SHA/status" --jq '[.statuses[].state]')
+            # Check runs, excluding this run's own job.
+            checks=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+              --jq "[.check_runs[] | select((.details_url // \"\") | contains(\"/runs/$RUN_ID/\") | not) | (.conclusion // \"pending\")]")
+            echo "statuses=$statuses checks=$checks"
+            if jq -e 'any(.[]; . == "failure" or . == "error")' <<<"$statuses" >/dev/null ||
+               jq -e 'any(.[]; . == "failure" or . == "cancelled" or . == "timed_out" or . == "action_required" or . == "startup_failure")' <<<"$checks" >/dev/null; then
+              echo "::notice::Not merging #$PR: a check failed on $SHA."
+              exit 0
+            fi
+            if jq -e 'length > 0 and all(.[]; . == "success")' <<<"$statuses" >/dev/null &&
+               jq -e 'all(.[]; . == "success" or . == "skipped" or . == "neutral")' <<<"$checks" >/dev/null; then
+              gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$SHA"
+              exit 0
+            fi
+            if (( SECONDS >= deadline )); then
+              echo "::notice::Not merging #$PR: checks on $SHA still pending after $WAIT_MINUTES minutes."
+              exit 0
+            fi
+            sleep 30
+          done
