@@ -29,7 +29,16 @@ name: Auto-merge Gate (Reusable)
 #
 # It never checks out or executes pull-request code; it reads Dependabot
 # metadata, file contents through the API, commit statuses and check runs only.
-# A merge made with GITHUB_TOKEN does not start push-triggered workflows.
+#
+# A merge made with GITHUB_TOKEN starts no push-triggered workflow, but GitHub
+# does run a repository_dispatch it sends. So once this gate has merged an
+# editorial PR, it sends one repository_dispatch event, editorial-merged, with
+# client_payload {before, after, pr}: the default branch moved from before to
+# after, the squash commit. A site workflow that does something after a merge
+# (search indexing, generated files) subscribes to it and calls
+# editorial-merge-paths.yml, which applies that workflow's own push paths to
+# before..after. Dependabot merges send nothing: no subscribed workflow watches
+# package files.
 #
 #   on:
 #     pull_request_target:
@@ -274,6 +283,10 @@ jobs:
             if jq -e 'length > 0 and all(.[]; .state == "success")' <<<"$statuses" >/dev/null &&
                jq -e 'all(.[]; .state == "success" or .state == "skipped" or .state == "neutral")' <<<"$checks" >/dev/null &&
                jq -e 'length == 0' <<<"$unmet" >/dev/null; then
+              # From here a newer evaluation no longer stops this one: a merge it
+              # makes must still send its dispatch, and the newer one finds the PR
+              # merged and sends none.
+              trap 'echo "Superseded while merging #$PR; finishing first."' INT TERM
               # GitHub refuses this merge unless the head is still $SHA. A refusal
               # or a concurrent merge is settled by reading the PR back.
               gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$SHA" || true
@@ -284,8 +297,26 @@ jobs:
               done
               case $state in
                 merged)
-                  echo "::notice::#$PR is merged; it was judged and merged at $SHA ($(gh api "repos/$REPO/pulls/$PR" --jq '"head \(.head.sha), merge commit \(.merge_commit_sha)"'))"
-                  exit 0 ;;
+                  merged=$(gh api "repos/$REPO/pulls/$PR")
+                  after=$(jq -r .merge_commit_sha <<<"$merged")
+                  echo "::notice::#$PR is merged; it was judged and merged at $SHA ($(jq -r '"head \(.head.sha), merge commit \(.merge_commit_sha), by \(.merged_by.login)"' <<<"$merged"))"
+                  # Only a merge made with this token skipped the push workflows; a
+                  # person's merge at the same moment already started them.
+                  if [[ $KIND != editorial || $(jq -r .merged_by.login <<<"$merged") != 'github-actions[bot]' ]]; then
+                    exit 0
+                  fi
+                  before=$(gh api "repos/$REPO/commits/$after" --jq '.parents[0].sha')
+                  payload=$(jq -nc --arg before "$before" --arg after "$after" --argjson pr "$PR" \
+                    '{event_type: "editorial-merged", client_payload: {before: $before, after: $after, pr: $pr}}')
+                  for attempt in 1 2 3; do
+                    if gh api "repos/$REPO/dispatches" --input - <<<"$payload"; then
+                      echo "::notice::Sent editorial-merged for #$PR: $payload"
+                      exit 0
+                    fi
+                    sleep $((attempt * 5))
+                  done
+                  echo "::error::#$PR is merged at $after, but editorial-merged was not sent; its post-merge workflows did not start."
+                  exit 1 ;;
                 moved)
                   echo "::notice::Not merging #$PR: its head moved off $SHA."
                   exit 0 ;;
