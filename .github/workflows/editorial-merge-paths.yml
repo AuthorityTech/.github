@@ -32,6 +32,11 @@ name: Editorial Merge Paths (Reusable)
 #             ref: ${{ github.event.client_payload.after || github.sha }}
 #         # The range is github.event.before || github.event.client_payload.before
 #         # to github.event.client_payload.after || github.sha.
+#
+# Every editorial merge starts a run of each subscribed workflow, matching or not.
+# Key a workflow-level concurrency group on the commit
+# (github.event.client_payload.after || github.sha), or put the group on the job,
+# so a run whose paths do not match never cancels or replaces another merge's run.
 
 on:
   workflow_call:
