@@ -208,6 +208,10 @@ jobs:
           WAIT_MINUTES: ${{ inputs.wait-minutes }}
         run: |
           set -euo pipefail
+          # A newer evaluation of this PR cancels this one. Bash defers a signal
+          # until a foreground child exits, so sleep in the background and leave
+          # as soon as the runner signals, instead of evaluating once more.
+          trap 'echo "Superseded by a newer evaluation of #$PR."; exit 143' INT TERM
           # The calling workflow's path, e.g. .github/workflows/dependabot-automerge.yml.
           caller="${WORKFLOW_REF#"$REPO/"}"
           caller="${caller%%@*}"
@@ -294,5 +298,6 @@ jobs:
               echo "::notice::Not merging #$PR yet: checks on $SHA still pending after $WAIT_MINUTES minutes; a later status or workflow run re-evaluates it."
               exit 0
             fi
-            sleep 60
+            sleep 60 &
+            wait $!
           done
