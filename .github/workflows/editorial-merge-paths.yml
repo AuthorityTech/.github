@@ -1,0 +1,120 @@
+name: Editorial Merge Paths (Reusable)
+
+# The merge gate (dependabot-automerge.yml) merges editorial PRs with GITHUB_TOKEN,
+# and GitHub starts no push-triggered workflow for such a merge. Once the gate has
+# merged one, it sends a repository_dispatch event, editorial-merged, with
+# client_payload {before, after, pr}: the default branch moved from before to after.
+#
+# A site workflow whose push run does something after a merge subscribes to that
+# event and calls this first. It applies the caller's own on.push.paths (or
+# paths-ignore) to before..after, reading them from the workflow file in after as
+# GitHub does for a push, so the dispatch runs the caller's job exactly when a push
+# of that merge would have. It also refuses an after that is not on the default
+# branch.
+#
+#   on:
+#     push:
+#       branches: [main]
+#       paths: [content/posts/**]
+#     repository_dispatch:
+#       types: [editorial-merged]
+#   jobs:
+#     paths:
+#       if: github.event_name == 'repository_dispatch'
+#       uses: AuthorityTech/.github/.github/workflows/editorial-merge-paths.yml@main
+#     work:
+#       needs: paths
+#       # The paths job is skipped on every other event; that must not skip this one.
+#       if: ${{ !cancelled() && (github.event_name != 'repository_dispatch' || needs.paths.outputs.match == 'true') }}
+#       steps:
+#         - uses: actions/checkout@v6
+#           with:
+#             ref: ${{ github.event.client_payload.after || github.sha }}
+#         # The range is github.event.before || github.event.client_payload.before
+#         # to github.event.client_payload.after || github.sha.
+#
+# Every editorial merge starts a run of each subscribed workflow, matching or not.
+# Key a workflow-level concurrency group on the commit
+# (github.event.client_payload.after || github.sha), or put the group on the job,
+# so a run whose paths do not match never cancels or replaces another merge's run.
+
+on:
+  workflow_call:
+    outputs:
+      match:
+        description: "'true' when a file changed in before..after matches the caller's push paths."
+        value: ${{ jobs.paths.outputs.match }}
+
+permissions:
+  contents: read
+
+jobs:
+  paths:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      match: ${{ steps.match.outputs.match }}
+    steps:
+      - name: Confirm the merge is on the default branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.client_payload.before }}
+          AFTER: ${{ github.event.client_payload.after }}
+        run: |
+          set -euo pipefail
+          if [[ ! $BEFORE =~ ^[0-9a-f]{40}$ || ! $AFTER =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::client_payload must carry 40-hex before and after commits."
+            exit 1
+          fi
+          base=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)
+          # ahead or identical: $base contains $AFTER.
+          on_base=$(gh api "repos/$GITHUB_REPOSITORY/compare/$AFTER...$base" --jq .status)
+          if [[ $on_base != ahead && $on_base != identical ]]; then
+            echo "::error::$AFTER is not on $base ($on_base); this event stands in only for a push to it."
+            exit 1
+          fi
+
+      - name: Check out the merge commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.client_payload.after }}
+
+      - name: Match the caller's push paths against before..after
+        id: match
+        env:
+          BEFORE: ${{ github.event.client_payload.before }}
+          AFTER: ${{ github.event.client_payload.after }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags --depth=1 origin "$BEFORE"
+          # The calling workflow's path, e.g. .github/workflows/search-indexing.yml.
+          caller="${WORKFLOW_REF#"$GITHUB_REPOSITORY/"}"
+          caller="${caller%%@*}"
+          paths=$(yq -o=json '.on.push.paths // null' "$caller")
+          ignore=$(yq -o=json '.on.push["paths-ignore"] // null' "$caller")
+          # GitHub's path globs as git pathspecs: * stops at /, ** crosses it, and
+          # a leading ! excludes.
+          specs=()
+          if [[ $paths != null ]]; then
+            while IFS= read -r p; do
+              if [[ $p == '!'* ]]; then specs+=(":(glob,exclude)${p#!}"); else specs+=(":(glob)$p"); fi
+            done < <(jq -r '.[]' <<<"$paths")
+          else
+            specs=(.)
+            if [[ $ignore != null ]]; then
+              while IFS= read -r p; do specs+=(":(glob,exclude)$p"); done < <(jq -r '.[]' <<<"$ignore")
+            fi
+          fi
+          echo "Push paths of $caller: ${specs[*]}"
+          echo "Changed in $BEFORE..$AFTER:"
+          git diff --name-only "$BEFORE" "$AFTER" | sed 's/^/  /'
+          matched=$(git diff --name-only "$BEFORE" "$AFTER" -- "${specs[@]}")
+          if [[ -n $matched ]]; then
+            echo "Matched:"
+            sed 's/^/  /' <<<"$matched"
+            echo "match=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Nothing in $BEFORE..$AFTER matches the push paths of $caller; as for a push, its job does not run."
+            echo "match=false" >> "$GITHUB_OUTPUT"
+          fi
