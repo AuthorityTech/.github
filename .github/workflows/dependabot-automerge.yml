@@ -267,6 +267,9 @@ jobs:
               [$req[] as $n | ([$s[], $c[]] | map(select(.name == $n))) as $m
                 | select(($m | length) == 0 or any($m[]; .state != "success")) | $n]')
             echo "statuses=$statuses checks=$checks unmet=$unmet"
+            waiting=$(jq -nc --argjson s "$statuses" --argjson c "$checks" --argjson u "$unmet" '
+              [(if ($s | length) == 0 then "a commit status" else empty end), ($s[] | select(.state != "success") | .name),
+               ($c[] | select(.state != "success" and .state != "skipped" and .state != "neutral") | .name), $u[]] | unique')
             if jq -e 'any(.[]; .state == "failure" or .state == "error")' <<<"$statuses" >/dev/null ||
                jq -e 'any(.[]; .state == "failure" or .state == "cancelled" or .state == "timed_out" or .state == "action_required" or .state == "startup_failure")' <<<"$checks" >/dev/null; then
               verdict=failed
@@ -297,7 +300,7 @@ jobs:
             case $verdict in
               failed) echo "::notice::Not merging #$PR: a check failed on $SHA."; exit 0 ;;
               partial) echo "::notice::Not merging #$PR: more than 100 statuses or check runs on $SHA."; exit 0 ;;
-              pending) echo "::notice::Not merging #$PR yet: $SHA is not green (required still unmet: $unmet). The status or workflow run that completes it re-evaluates the PR."; exit 0 ;;
+              pending) echo "::notice::Not merging #$PR yet: $SHA is waiting on $waiting. The status or workflow run that completes it re-evaluates the PR."; exit 0 ;;
             esac
             # GitHub refuses this merge unless the head is still $SHA (409). It also
             # refuses while another evaluation of the same green head is merging it,
