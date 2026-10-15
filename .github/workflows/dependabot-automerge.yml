@@ -11,34 +11,42 @@ name: Auto-merge Gate (Reusable)
 #   events (the metadata action reads the pull_request payload).
 # - Editorial publication PRs: head branch in this same repository named
 #   editorial/..., base the default branch, any author. The publisher opens them
-#   and waits for this gate to merge. Every name in editorial-required-checks (a
-#   check run or a commit status context) must be present and successful; a
-#   missing one is pending, never a pass.
+#   and returns; nothing waits for this gate. Every name in
+#   editorial-required-checks (a check run or a commit status context) must be
+#   present and successful; a missing one is pending, never a pass.
 #
 # Both kinds fail closed: any failed status or check on the head stops the merge,
 # at least one commit status must exist and all must be success, every other check
-# run must be success, skipped or neutral, and the merge names the head it judged
-# (--match-head-commit), so GitHub refuses it if the branch moved.
+# run must be success, skipped or neutral, and the merge names the head it judged,
+# so GitHub refuses it if the branch moved.
 #
-# Recovery is event-driven at GitHub, with no sweeper. Besides the PR's own
-# events, every successful commit status and every completed run of the site's PR
-# workflows on an editorial/ branch re-evaluates the open eligible PRs whose head
-# is that commit. A check that reports after an earlier evaluation stopped waiting
-# still merges the PR. One evaluation per PR runs at a time; a newer one cancels
-# the older, and each waits at most wait-minutes.
+# Editorial evaluations are single-shot and event-driven, with no sweeper and no
+# waiting: each one reads the PR and its head commit once, merges if everything
+# is green, and otherwise exits successfully. Besides the PR's own events, every
+# successful commit status and every completed run of the site's PR workflows on
+# an editorial/ branch starts a new evaluation of the open eligible PRs whose
+# head is that commit, so the event that completes the last check is the one that
+# merges. Evaluations never supersede or cancel each other, so an editorial PR
+# head carries no cancelled or failed gate run. Two evaluations of the same green
+# head can race; GitHub merges once and the other finds the PR merged.
+#
+# Dependabot PRs are evaluated only on their own pull_request events, so one
+# evaluation waits up to wait-minutes for the checks, and a newer one cancels the
+# older.
 #
 # It never checks out or executes pull-request code; it reads Dependabot
 # metadata, file contents through the API, commit statuses and check runs only.
 #
 # A merge made with GITHUB_TOKEN starts no push-triggered workflow, but GitHub
-# does run a repository_dispatch it sends. So once this gate has merged an
-# editorial PR, it sends one repository_dispatch event, editorial-merged, with
-# client_payload {before, after, pr}: the default branch moved from before to
-# after, the squash commit. A site workflow that does something after a merge
+# does run a repository_dispatch it sends. So the evaluation whose merge of an
+# editorial PR succeeded sends one repository_dispatch event, editorial-merged,
+# with client_payload {before, after, pr}: the default branch moved from before
+# to after, the squash commit. A site workflow that does something after a merge
 # (search indexing, generated files) subscribes to it and calls
 # editorial-merge-paths.yml, which applies that workflow's own push paths to
-# before..after. Dependabot merges send nothing: no subscribed workflow watches
-# package files.
+# before..after. A workflow on deployment_status needs neither: Vercel's
+# deployment of the merge starts it. Dependabot merges send nothing: no
+# subscribed workflow watches package files.
 #
 #   on:
 #     pull_request_target:
@@ -61,11 +69,12 @@ name: Auto-merge Gate (Reusable)
 #           Vercel
 #           site-integrity / changes
 
+
 on:
   workflow_call:
     inputs:
       wait-minutes:
-        description: How long one evaluation waits for the head commit's checks before leaving the PR for a later event.
+        description: How long one Dependabot evaluation waits for the head commit's checks. Editorial evaluations never wait.
         required: false
         type: number
         default: 40
@@ -143,12 +152,13 @@ jobs:
       matrix:
         pr: ${{ fromJSON(needs.resolve.outputs.prs) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 50
-    # One evaluation per PR: a newer event's evaluation, or a newer push,
-    # supersedes the wait on the old one.
+    timeout-minutes: ${{ matrix.pr.kind == 'editorial' && 5 || 50 }}
+    # Dependabot: one evaluation per PR, and a newer one supersedes the wait on the
+    # old. Editorial: every evaluation is its own group, so none is queued behind,
+    # replaced by or cancelled by another.
     concurrency:
-      group: automerge-${{ github.repository }}-${{ matrix.pr.number }}
-      cancel-in-progress: true
+      group: automerge-${{ github.repository }}-${{ matrix.pr.number }}${{ matrix.pr.kind == 'editorial' && format('-{0}-{1}', github.run_id, github.run_attempt) || '' }}
+      cancel-in-progress: ${{ matrix.pr.kind != 'editorial' }}
     steps:
       - name: Read Dependabot metadata
         id: metadata
@@ -217,10 +227,6 @@ jobs:
           WAIT_MINUTES: ${{ inputs.wait-minutes }}
         run: |
           set -euo pipefail
-          # A newer evaluation of this PR cancels this one. Bash defers a signal
-          # until a foreground child exits, so sleep in the background and leave
-          # as soon as the runner signals, instead of evaluating once more.
-          trap 'echo "Superseded by a newer evaluation of #$PR."; exit 143' INT TERM
           # The calling workflow's path, e.g. .github/workflows/dependabot-automerge.yml.
           caller="${WORKFLOW_REF#"$REPO/"}"
           caller="${caller%%@*}"
@@ -242,23 +248,14 @@ jobs:
             required=$(printf '%s\n' "$REQUIRED" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | jq -Rsc 'split("\n") | map(select(length > 0))')
           fi
           echo "#$PR ($KIND) at $SHA; required: $required"
-          deadline=$((SECONDS + WAIT_MINUTES * 60))
-          while :; do
-            state=$(pr_state)
-            if [[ $state == merged ]]; then
-              echo "::notice::#$PR is already merged."
-              exit 0
-            elif [[ $state != open ]]; then
-              echo "::notice::Not merging #$PR: it is $state (judged head $SHA)."
-              exit 0
-            fi
+          # One read of the head commit. Sets verdict to failed, partial, green or pending.
+          read_checks() {
             # Commit statuses: Vercel reports the build here. At least one must
             # exist, so a repo or PR with no build never merges blind.
             status=$(gh api "repos/$REPO/commits/$SHA/status?per_page=100")
             statuses=$(jq -c '[.statuses[] | {name: .context, state}]' <<<"$status")
             # Check runs, excluding every run of this gate on the same head (this
-            # one, and earlier or cancelled ones), so the gate never waits on or
-            # vetoes itself.
+            # one, and earlier ones), so the gate never waits on or vetoes itself.
             own=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" \
               --jq "[.workflow_runs[] | select(.path == \"$caller\") | .check_suite_id]")
             runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100")
@@ -270,22 +267,104 @@ jobs:
               [$req[] as $n | ([$s[], $c[]] | map(select(.name == $n))) as $m
                 | select(($m | length) == 0 or any($m[]; .state != "success")) | $n]')
             echo "statuses=$statuses checks=$checks unmet=$unmet"
+            waiting=$(jq -nc --argjson s "$statuses" --argjson c "$checks" --argjson u "$unmet" '
+              [(if ($s | length) == 0 then "a commit status" else empty end), ($s[] | select(.state != "success") | .name),
+               ($c[] | select(.state != "success" and .state != "skipped" and .state != "neutral") | .name), $u[]] | unique')
             if jq -e 'any(.[]; .state == "failure" or .state == "error")' <<<"$statuses" >/dev/null ||
                jq -e 'any(.[]; .state == "failure" or .state == "cancelled" or .state == "timed_out" or .state == "action_required" or .state == "startup_failure")' <<<"$checks" >/dev/null; then
+              verdict=failed
+            # A page beyond the first could hide a failure; never merge on a partial read.
+            elif (( $(jq '.total_count' <<<"$status") > 100 || $(jq '.total_count' <<<"$runs") > 100 )); then
+              verdict=partial
+            elif jq -e 'length > 0 and all(.[]; .state == "success")' <<<"$statuses" >/dev/null &&
+                 jq -e 'all(.[]; .state == "success" or .state == "skipped" or .state == "neutral")' <<<"$checks" >/dev/null &&
+                 jq -e 'length == 0' <<<"$unmet" >/dev/null; then
+              verdict=green
+            else
+              verdict=pending
+            fi
+          }
+
+          if [[ $KIND == editorial ]]; then
+            # Single-shot: read once, merge if green, otherwise leave it to the
+            # next status or workflow run on this head. Nothing here waits.
+            state=$(pr_state)
+            if [[ $state == merged ]]; then
+              echo "::notice::#$PR is already merged."
+              exit 0
+            elif [[ $state != open ]]; then
+              echo "::notice::Not merging #$PR: it is $state (judged head $SHA)."
+              exit 0
+            fi
+            read_checks
+            case $verdict in
+              failed) echo "::notice::Not merging #$PR: a check failed on $SHA."; exit 0 ;;
+              partial) echo "::notice::Not merging #$PR: more than 100 statuses or check runs on $SHA."; exit 0 ;;
+              pending) echo "::notice::Not merging #$PR yet: $SHA is waiting on $waiting. The status or workflow run that completes it re-evaluates the PR."; exit 0 ;;
+            esac
+            # GitHub refuses this merge unless the head is still $SHA (409). It also
+            # refuses while another evaluation of the same green head is merging it,
+            # or when the base moved under a merge a moment ago (405): the merge is
+            # retried briefly, since no later event may come to retry it.
+            title=$(gh api "repos/$REPO/pulls/$PR" --jq .title)
+            for attempt in 1 2 3 4; do
+              if merged=$(gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=squash -f sha="$SHA" \
+                            -f commit_title="$title (#$PR)" 2>"$RUNNER_TEMP/merge.err"); then
+                after=$(jq -r .sha <<<"$merged")
+                echo "::notice::Merged #$PR at its judged head $SHA; merge commit $after."
+                # Only this evaluation merged it, so only this one sends the dispatch.
+                before=$(gh api "repos/$REPO/commits/$after" --jq '.parents[0].sha')
+                payload=$(jq -nc --arg before "$before" --arg after "$after" --argjson pr "$PR" \
+                  '{event_type: "editorial-merged", client_payload: {before: $before, after: $after, pr: $pr}}')
+                for try in 1 2 3; do
+                  if gh api "repos/$REPO/dispatches" --input - <<<"$payload"; then
+                    echo "::notice::Sent editorial-merged for #$PR: $payload"
+                    exit 0
+                  fi
+                  sleep $((try * 5))
+                done
+                echo "::error::#$PR is merged at $after, but editorial-merged was not sent; its post-merge workflows did not start."
+                exit 1
+              fi
+              refusal=$(cat "$RUNNER_TEMP/merge.err" 2>/dev/null || true)
+              echo "Merge attempt $attempt refused: $refusal"
+              sleep $((attempt * 3))
+              state=$(pr_state)
+              case $state in
+                merged) echo "::notice::#$PR was merged by a concurrent evaluation of the same head; that one sends editorial-merged."; exit 0 ;;
+                open) ;;
+                *) echo "::notice::Not merging #$PR: it is $state (judged head $SHA)."; exit 0 ;;
+              esac
+            done
+            echo "::error::GitHub refused to merge #$PR at its green head $SHA: $refusal"
+            exit 1
+          fi
+
+          # Dependabot. A newer evaluation of this PR cancels this one. Bash defers
+          # a signal until a foreground child exits, so sleep in the background and
+          # leave as soon as the runner signals, instead of evaluating once more.
+          trap 'echo "Superseded by a newer evaluation of #$PR."; exit 143' INT TERM
+          deadline=$((SECONDS + WAIT_MINUTES * 60))
+          while :; do
+            state=$(pr_state)
+            if [[ $state == merged ]]; then
+              echo "::notice::#$PR is already merged."
+              exit 0
+            elif [[ $state != open ]]; then
+              echo "::notice::Not merging #$PR: it is $state (judged head $SHA)."
+              exit 0
+            fi
+            read_checks
+            if [[ $verdict == failed ]]; then
               echo "::notice::Not merging #$PR: a check failed on $SHA."
               exit 0
             fi
-            # A page beyond the first could hide a failure; never merge on a partial read.
-            if (( $(jq '.total_count' <<<"$status") > 100 || $(jq '.total_count' <<<"$runs") > 100 )); then
+            if [[ $verdict == partial ]]; then
               echo "::notice::Not merging #$PR: more than 100 statuses or check runs on $SHA."
               exit 0
             fi
-            if jq -e 'length > 0 and all(.[]; .state == "success")' <<<"$statuses" >/dev/null &&
-               jq -e 'all(.[]; .state == "success" or .state == "skipped" or .state == "neutral")' <<<"$checks" >/dev/null &&
-               jq -e 'length == 0' <<<"$unmet" >/dev/null; then
-              # From here a newer evaluation no longer stops this one: a merge it
-              # makes must still send its dispatch, and the newer one finds the PR
-              # merged and sends none.
+            if [[ $verdict == green ]]; then
+              # From here a newer evaluation no longer stops this one.
               trap 'echo "Superseded while merging #$PR; finishing first."' INT TERM
               # GitHub refuses this merge unless the head is still $SHA. A refusal
               # or a concurrent merge is settled by reading the PR back.
@@ -298,25 +377,8 @@ jobs:
               case $state in
                 merged)
                   merged=$(gh api "repos/$REPO/pulls/$PR")
-                  after=$(jq -r .merge_commit_sha <<<"$merged")
                   echo "::notice::#$PR is merged; it was judged and merged at $SHA ($(jq -r '"head \(.head.sha), merge commit \(.merge_commit_sha), by \(.merged_by.login)"' <<<"$merged"))"
-                  # Only a merge made with this token skipped the push workflows; a
-                  # person's merge at the same moment already started them.
-                  if [[ $KIND != editorial || $(jq -r .merged_by.login <<<"$merged") != 'github-actions[bot]' ]]; then
-                    exit 0
-                  fi
-                  before=$(gh api "repos/$REPO/commits/$after" --jq '.parents[0].sha')
-                  payload=$(jq -nc --arg before "$before" --arg after "$after" --argjson pr "$PR" \
-                    '{event_type: "editorial-merged", client_payload: {before: $before, after: $after, pr: $pr}}')
-                  for attempt in 1 2 3; do
-                    if gh api "repos/$REPO/dispatches" --input - <<<"$payload"; then
-                      echo "::notice::Sent editorial-merged for #$PR: $payload"
-                      exit 0
-                    fi
-                    sleep $((attempt * 5))
-                  done
-                  echo "::error::#$PR is merged at $after, but editorial-merged was not sent; its post-merge workflows did not start."
-                  exit 1 ;;
+                  exit 0 ;;
                 moved)
                   echo "::notice::Not merging #$PR: its head moved off $SHA."
                   exit 0 ;;
@@ -326,7 +388,7 @@ jobs:
               esac
             fi
             if (( SECONDS >= deadline )); then
-              echo "::notice::Not merging #$PR yet: checks on $SHA still pending after $WAIT_MINUTES minutes; a later status or workflow run re-evaluates it."
+              echo "::notice::Not merging #$PR yet: checks on $SHA still pending after $WAIT_MINUTES minutes."
               exit 0
             fi
             sleep 60 &
