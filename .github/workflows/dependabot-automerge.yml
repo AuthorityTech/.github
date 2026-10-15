@@ -299,35 +299,42 @@ jobs:
               partial) echo "::notice::Not merging #$PR: more than 100 statuses or check runs on $SHA."; exit 0 ;;
               pending) echo "::notice::Not merging #$PR yet: $SHA is not green (required still unmet: $unmet). The status or workflow run that completes it re-evaluates the PR."; exit 0 ;;
             esac
-            # GitHub refuses this merge unless the head is still $SHA (409) or the
-            # PR is no longer mergeable, including already merged (405).
+            # GitHub refuses this merge unless the head is still $SHA (409). It also
+            # refuses while another evaluation of the same green head is merging it,
+            # or when the base moved under a merge a moment ago (405): the merge is
+            # retried briefly, since no later event may come to retry it.
             title=$(gh api "repos/$REPO/pulls/$PR" --jq .title)
-            if merged=$(gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=squash -f sha="$SHA" \
-                          -f commit_title="$title (#$PR)" 2>"$RUNNER_TEMP/merge.err"); then
-              after=$(jq -r .sha <<<"$merged")
-              echo "::notice::Merged #$PR at its judged head $SHA; merge commit $after."
-              # Only this evaluation merged it, so only this one sends the dispatch.
-              before=$(gh api "repos/$REPO/commits/$after" --jq '.parents[0].sha')
-              payload=$(jq -nc --arg before "$before" --arg after "$after" --argjson pr "$PR" \
-                '{event_type: "editorial-merged", client_payload: {before: $before, after: $after, pr: $pr}}')
-              for attempt in 1 2 3; do
-                if gh api "repos/$REPO/dispatches" --input - <<<"$payload"; then
-                  echo "::notice::Sent editorial-merged for #$PR: $payload"
-                  exit 0
-                fi
-                sleep $((attempt * 5))
-              done
-              echo "::error::#$PR is merged at $after, but editorial-merged was not sent; its post-merge workflows did not start."
-              exit 1
-            fi
-            cat "$RUNNER_TEMP/merge.err" >&2 || true
-            state=$(pr_state)
-            case $state in
-              merged) echo "::notice::#$PR was merged by a concurrent evaluation of the same head; that one sends editorial-merged." ;;
-              moved) echo "::notice::Not merging #$PR: its head moved off $SHA." ;;
-              *) echo "::error::Merging #$PR at $SHA failed; the PR is $state."; exit 1 ;;
-            esac
-            exit 0
+            for attempt in 1 2 3 4; do
+              if merged=$(gh api -X PUT "repos/$REPO/pulls/$PR/merge" -f merge_method=squash -f sha="$SHA" \
+                            -f commit_title="$title (#$PR)" 2>"$RUNNER_TEMP/merge.err"); then
+                after=$(jq -r .sha <<<"$merged")
+                echo "::notice::Merged #$PR at its judged head $SHA; merge commit $after."
+                # Only this evaluation merged it, so only this one sends the dispatch.
+                before=$(gh api "repos/$REPO/commits/$after" --jq '.parents[0].sha')
+                payload=$(jq -nc --arg before "$before" --arg after "$after" --argjson pr "$PR" \
+                  '{event_type: "editorial-merged", client_payload: {before: $before, after: $after, pr: $pr}}')
+                for try in 1 2 3; do
+                  if gh api "repos/$REPO/dispatches" --input - <<<"$payload"; then
+                    echo "::notice::Sent editorial-merged for #$PR: $payload"
+                    exit 0
+                  fi
+                  sleep $((try * 5))
+                done
+                echo "::error::#$PR is merged at $after, but editorial-merged was not sent; its post-merge workflows did not start."
+                exit 1
+              fi
+              refusal=$(cat "$RUNNER_TEMP/merge.err" 2>/dev/null || true)
+              echo "Merge attempt $attempt refused: $refusal"
+              sleep $((attempt * 3))
+              state=$(pr_state)
+              case $state in
+                merged) echo "::notice::#$PR was merged by a concurrent evaluation of the same head; that one sends editorial-merged."; exit 0 ;;
+                open) ;;
+                *) echo "::notice::Not merging #$PR: it is $state (judged head $SHA)."; exit 0 ;;
+              esac
+            done
+            echo "::error::GitHub refused to merge #$PR at its green head $SHA: $refusal"
+            exit 1
           fi
 
           # Dependabot. A newer evaluation of this PR cancels this one. Bash defers
