@@ -13,7 +13,12 @@ name: Auto-merge Gate (Reusable)
 #   editorial/..., base the default branch, any author. The publisher opens them
 #   and returns; nothing waits for this gate. Every name in
 #   editorial-required-checks (a check run or a commit status context) must be
-#   present and successful; a missing one is pending, never a pass.
+#   present and successful; a missing one is pending, never a pass. So list only
+#   names that every editorial PR produces: the Vercel status, and checks whose
+#   workflows trigger on every path the publisher writes (portfolio-retired-
+#   pointers triggers on content/** and portfolio/**). A path-filtered check needs
+#   no listing to block: every present check must pass. Listed, it holds every
+#   editorial PR outside its paths forever.
 #
 # Both kinds fail closed: any failed status or check on the head stops the merge,
 # at least one commit status must exist and all must be success, every other check
@@ -67,7 +72,7 @@ name: Auto-merge Gate (Reusable)
 #       with:
 #         editorial-required-checks: |
 #           Vercel
-#           site-integrity / changes
+#           portfolio-retired-pointers
 
 
 on:
@@ -79,7 +84,7 @@ on:
         type: number
         default: 40
       editorial-required-checks:
-        description: Newline-separated check run names or commit status contexts that must be present and successful before an editorial PR merges.
+        description: Newline-separated check run names or commit status contexts that must be present and successful before an editorial PR merges. List only names every editorial PR produces; a path-filtered check blocks whenever it runs without being listed.
         required: false
         type: string
         default: ""
