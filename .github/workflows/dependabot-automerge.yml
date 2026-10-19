@@ -31,7 +31,9 @@ name: Auto-merge Gate (Reusable)
 # successful commit status and every completed run of the site's PR workflows on
 # an editorial/ branch starts a new evaluation of the open eligible PRs whose
 # head is that commit, so the event that completes the last check is the one that
-# merges. Evaluations never supersede or cancel each other, so an editorial PR
+# merges. A read that still shows the completing run's own checks unfinished is
+# retried for up to a minute, since no later event may come. Evaluations never
+# supersede or cancel each other, so an editorial PR
 # head carries no cancelled or failed gate run. Two evaluations of the same green
 # head can race; GitHub merges once and the other finds the PR merged.
 #
@@ -230,6 +232,9 @@ jobs:
           REQUIRED: ${{ inputs.editorial-required-checks }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WAIT_MINUTES: ${{ inputs.wait-minutes }}
+          # Set when a completed workflow run started this evaluation: that run's
+          # check suite is finished, whatever a read just after says.
+          TRIGGER_SUITE: ${{ github.event.workflow_run.check_suite_id }}
         run: |
           set -euo pipefail
           # The calling workflow's path, e.g. .github/workflows/dependabot-automerge.yml.
@@ -266,6 +271,9 @@ jobs:
             runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100")
             checks=$(jq -c --argjson own "$own" '[.check_runs[] | select(.check_suite.id as $s | $own | index($s) | not)
               | {name, state: (.conclusion // "pending")}]' <<<"$runs")
+            # Check runs of the completed run that started this evaluation that the
+            # API still reports unfinished: a read that lags the event.
+            lagging=$(jq --arg suite "${TRIGGER_SUITE:-}" '[.check_runs[] | select($suite != "" and (.check_suite.id | tostring) == $suite and .conclusion == null)] | length' <<<"$runs")
             # A required name is met only when it is present and every status or
             # check run carrying it succeeded.
             unmet=$(jq -nc --argjson req "$required" --argjson s "$statuses" --argjson c "$checks" '
@@ -302,6 +310,14 @@ jobs:
               exit 0
             fi
             read_checks
+            # This evaluation may be the last event this head gets, so a read that
+            # lags the run which started it is retried briefly instead of trusted.
+            for retry in 1 2 3 4; do
+              [[ $verdict == pending ]] && (( lagging > 0 )) || break
+              echo "The run that started this evaluation completed, but $lagging of its check runs still read unfinished; re-reading."
+              sleep 15
+              read_checks
+            done
             case $verdict in
               failed) echo "::notice::Not merging #$PR: a check failed on $SHA."; exit 0 ;;
               partial) echo "::notice::Not merging #$PR: more than 100 statuses or check runs on $SHA."; exit 0 ;;
