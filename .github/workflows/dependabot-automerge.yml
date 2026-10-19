@@ -15,10 +15,13 @@ name: Auto-merge Gate (Reusable)
 #   editorial-required-checks (a check run or a commit status context) must be
 #   present and successful; a missing one is pending, never a pass. So list only
 #   names that every editorial PR produces: the Vercel status, and checks whose
-#   workflows trigger on every path the publisher writes (portfolio-retired-
-#   pointers triggers on content/** and portfolio/**). A path-filtered check needs
-#   no listing to block: every present check must pass. Listed, it holds every
-#   editorial PR outside its paths forever.
+#   workflows run on every pull request, with no paths filter. "Every path the
+#   publisher writes" is not enough, because hand-made editorial/ PRs change code
+#   too: portfolio-retired-pointers was filtered to content/** and portfolio/**,
+#   and held a src-only PR (jaxonparrott.com #110) until it was merged by hand. A
+#   path-filtered check needs no listing to block: every present check must pass.
+#   Listed, it holds every editorial PR outside its paths forever, and each
+#   evaluation of that PR exits successfully, so nothing shows it is stuck.
 #
 # Both kinds fail closed: any failed status or check on the head stops the merge,
 # at least one commit status must exist and all must be success, every other check
@@ -86,7 +89,7 @@ on:
         type: number
         default: 40
       editorial-required-checks:
-        description: Newline-separated check run names or commit status contexts that must be present and successful before an editorial PR merges. List only names every editorial PR produces; a path-filtered check blocks whenever it runs without being listed.
+        description: Newline-separated check run names or commit status contexts that must be present and successful before an editorial PR merges. List only names every editorial PR produces, from workflows with no pull_request paths filter; a path-filtered check blocks whenever it runs without being listed.
         required: false
         type: string
         default: ""
