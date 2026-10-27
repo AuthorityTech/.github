@@ -391,17 +391,28 @@ jobs:
               # From here a newer evaluation no longer stops this one.
               trap 'echo "Superseded while merging #$PR; finishing first."' INT TERM
               # GitHub refuses this merge unless the head is still $SHA. A refusal
-              # or a concurrent merge is settled by reading the PR back.
+              # or a concurrent merge is settled by reading the PR back. On a base
+              # that requires a merge queue the same command queues the PR (or arms
+              # it to queue), and the queue merges it once its checks pass there.
               gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$SHA" || true
               for _ in 1 2 3 4 5; do
                 state=$(pr_state)
                 [[ $state == open ]] || break
                 sleep 3
               done
+              if [[ $state == open && $(gh api graphql -F n="$PR" -f owner="${REPO%/*}" -f name="${REPO#*/}" -f query='
+                    query($owner: String!, $name: String!, $n: Int!) { repository(owner: $owner, name: $name) {
+                      pullRequest(number: $n) { isInMergeQueue autoMergeRequest { enabledAt } } } }' \
+                    --jq '.data.repository.pullRequest | .isInMergeQueue or .autoMergeRequest != null') == true ]]; then
+                state=queued
+              fi
               case $state in
                 merged)
                   merged=$(gh api "repos/$REPO/pulls/$PR")
                   echo "::notice::#$PR is merged; it was judged and merged at $SHA ($(jq -r '"head \(.head.sha), merge commit \(.merge_commit_sha), by \(.merged_by.login)"' <<<"$merged"))"
+                  exit 0 ;;
+                queued)
+                  echo "::notice::#$PR is queued or armed to merge at its judged head $SHA; GitHub merges it once its checks pass there."
                   exit 0 ;;
                 moved)
                   echo "::notice::Not merging #$PR: its head moved off $SHA."
