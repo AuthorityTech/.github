@@ -44,6 +44,18 @@ name: Auto-merge Gate (Reusable)
 # evaluation waits up to wait-minutes for the checks, and a newer one cancels the
 # older.
 #
+# A base whose rules include a merge queue gets no merge, arm or enqueue from
+# this gate, because GitHub's token cannot merge through a queue: a PR it arms
+# while checks are pending never enters the queue, and one it queues once green
+# gets a merge group that starts no workflow, which holds the whole queue until
+# its check timeout. There a Dependabot PR this gate would have merged is
+# labelled dependabot-eligible instead, with one comment, and a CodeOps seat
+# merges it through the queue. Every Dependabot evaluation first takes that
+# label off, so it marks only a head this gate judged eligible and green. An
+# editorial PR on such a base is left for a seat. Labels and comments need only
+# the pull-requests: write the merge already has. A base without a queue is
+# unchanged.
+#
 # It never checks out or executes pull-request code; it reads Dependabot
 # metadata, file contents through the API, commit statuses and check runs only.
 #
@@ -170,6 +182,20 @@ jobs:
       group: automerge-${{ github.repository }}-${{ matrix.pr.number }}${{ matrix.pr.kind == 'editorial' && format('-{0}-{1}', github.run_id, github.run_attempt) || '' }}
       cancel-in-progress: ${{ matrix.pr.kind != 'editorial' }}
     steps:
+      - name: Take dependabot-eligible off until this evaluation judges the head
+        if: matrix.pr.kind == 'dependabot'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ matrix.pr.number }}
+        run: |
+          set -euo pipefail
+          labels=$(gh api --paginate "repos/$REPO/issues/$PR/labels" --jq '.[].name')
+          if grep -qx dependabot-eligible <<<"$labels"; then
+            gh api -X DELETE "repos/$REPO/issues/$PR/labels/dependabot-eligible" >/dev/null
+            echo "Took dependabot-eligible off #$PR until this evaluation judges its head."
+          fi
+
       - name: Read Dependabot metadata
         id: metadata
         if: matrix.pr.kind == 'dependabot'
@@ -238,12 +264,18 @@ jobs:
           # Set when a completed workflow run started this evaluation: that run's
           # check suite is finished, whatever a read just after says.
           TRIGGER_SUITE: ${{ github.event.workflow_run.check_suite_id }}
+          # The PR's base on its own events; status and workflow_run events have
+          # none, and an eligible editorial PR's base is the default branch.
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
           # The calling workflow's path, e.g. .github/workflows/dependabot-automerge.yml.
           caller="${WORKFLOW_REF#"$REPO/"}"
           caller="${caller%%@*}"
           base=$(gh api "repos/$REPO" --jq .default_branch)
+          # Non-empty when the base merges only through a merge queue, where this
+          # gate merges nothing (see the top of this file).
+          queue=$(gh api --paginate "repos/$REPO/rules/branches/${BASE_REF:-$base}" --jq '.[] | select(.type == "merge_queue") | .type')
           # Where the PR stands now: merged, closed, moved (head is no longer $SHA),
           # draft, ineligible, or open.
           pr_state() {
@@ -310,6 +342,10 @@ jobs:
               exit 0
             elif [[ $state != open ]]; then
               echo "::notice::Not merging #$PR: it is $state (judged head $SHA)."
+              exit 0
+            fi
+            if [[ -n $queue ]]; then
+              echo "::notice::Not merging #$PR: $base merges only through a merge queue, which this workflow's token cannot use; a seat merges it there."
               exit 0
             fi
             read_checks
@@ -390,6 +426,20 @@ jobs:
             if [[ $verdict == green ]]; then
               # From here a newer evaluation no longer stops this one.
               trap 'echo "Superseded while merging #$PR; finishing first."' INT TERM
+              if [[ -n $queue ]]; then
+                # The repository's first eligible PR creates the label; until then GitHub answers 404.
+                gh api "repos/$REPO/labels/dependabot-eligible" >/dev/null 2>&1 ||
+                  gh api "repos/$REPO/labels" -f name=dependabot-eligible -f color=0e8a16 \
+                    -f description="Eligible and green for the Auto-merge gate; CodeOps merges it through the merge queue" >/dev/null
+                gh api "repos/$REPO/issues/$PR/labels" -f "labels[]=dependabot-eligible" >/dev/null
+                said=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+                  --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("Auto-merge gate:"))) | .id')
+                if [[ -z $said ]]; then
+                  gh api "repos/$REPO/issues/$PR/comments" -f body="Auto-merge gate: eligible and green. This base merges only through a merge queue, which the workflow token cannot use, so this pull request is labelled \`dependabot-eligible\` and a CodeOps seat merges it through the merge queue." >/dev/null
+                fi
+                echo "::notice::#$PR is eligible and green at $SHA. Its base merges only through a merge queue, so it is labelled dependabot-eligible for a CodeOps seat to merge there."
+                exit 0
+              fi
               # GitHub refuses this merge unless the head is still $SHA. A refusal
               # or a concurrent merge is settled by reading the PR back.
               gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$SHA" || true
