@@ -23,6 +23,13 @@ a = sys.argv[1:]
 with (root / 'calls.jsonl').open('a') as log: log.write(json.dumps(a) + '\\n')
 url = next((v for v in a if v.startswith('repos/')), '')
 def output(value): print(json.dumps(value))
+if a[:2] == ['pr', 'merge']:
+    assert '--match-head-commit' in a and a[a.index('--match-head-commit')+1] == 'a'*40
+    assert '--repo' in a and a[a.index('--repo')+1] == os.environ['REPO']
+    assert '--squash' in a
+    f['pr']['merged'] = True
+    (root / 'fixture.json').write_text(json.dumps(f))
+    sys.exit(0)
 if a[0] != 'api': sys.exit('unexpected non-API command')
 if '-X' in a and a[a.index('-X')+1] == 'PUT':
     if f.get('refuse_merge'):
@@ -38,6 +45,10 @@ if '/rules/branches/' in url:
 elif '/files?' in url:
     if f.get('file_api_error'): sys.exit(1)
     output(f['files'])
+elif url.endswith('/labels/dependabot-eligible'): output({'name': 'dependabot-eligible'})
+elif '/issues/' in url and url.endswith('/labels'): output([{'name': 'dependabot-eligible'}])
+elif '/issues/' in url and url.endswith('/comments'):
+    if '-f' in a: output({'id': 1})
 elif '/pulls/' in url:
     count_file = root / 'reads'
     count = int(count_file.read_text()) if count_file.exists() else 0
@@ -79,10 +90,10 @@ class PublicationGate(unittest.TestCase):
             (root / 'fixture.json').write_text(json.dumps(f))
             for name, script in [('gh', MOCK), ('sleep', '#!/bin/sh\nexit 0\n')]:
                 p = root / name; p.write_text(script); p.chmod(0o755)
-            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, RUNNER_TEMP=d, GH_TOKEN='local-fixture-only', REPO=repo, PR='1', SHA=HEAD, KIND=kind, REQUIRED='\n'.join(required or ['Vercel', *NAMES]), CONTENT_WITHOUT_PREVIEW=enabled, WORKFLOW_REF=repo + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE=trigger, BASE_REF='main')
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, RUNNER_TEMP=d, GH_TOKEN='local-fixture-only', REPO=repo, PR='1', SHA=HEAD, KIND=kind, REQUIRED='\n'.join(['Vercel', *NAMES] if required is None else required), CONTENT_WITHOUT_PREVIEW=enabled, WORKFLOW_REF=repo + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE=trigger, BASE_REF='main')
             result = subprocess.run(['bash', '-c', SCRIPT], env=env, text=True, capture_output=True, timeout=10)
             calls = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()]
-            merged = any('-X' in c and 'PUT' in c for c in calls)
+            merged = any(('-X' in c and 'PUT' in c) or c[:2] == ['pr', 'merge'] for c in calls)
             return result, merged, calls
 
     def assert_held(self, f, **kwargs):
@@ -141,7 +152,7 @@ class PublicationGate(unittest.TestCase):
 
     def test_other_callers_and_default_input_retain_status_dependency(self):
         self.assert_held(fixture(), enabled='false')
-        for repo in ['AuthorityTech/website', 'AuthorityTech/christianlehman.com', 'Bramwell-Inc/machinerelations.ai', 'Bramwell-Inc/paralabs.ai', 'Bramwell-Inc/paralax.ai']:
+        for repo in ['AuthorityTech/website', 'AuthorityTech/christianlehman.com', 'Bramwell-Inc/machinerelations.ai', 'Bramwell-Inc/paralabs.ai', 'Bramwell-Inc/paralax.ai', 'AuthorityTech/app']:
             for enabled in ['false', 'true']:
                 f = fixture(); f['pr']['head']['repo']['full_name'] = repo
                 r, calls = self.assert_held(f, repo=repo, enabled=enabled)
@@ -175,5 +186,36 @@ class PublicationGate(unittest.TestCase):
 
     def test_dependabot_still_needs_a_status(self):
         self.assert_held(fixture(), kind='dependabot')
+
+    def test_app_dependabot_preserves_checks_exact_head_and_queue_handling(self):
+        def app_fixture():
+            f = fixture()
+            f['pr']['head'].update(ref='dependabot/npm_and_yarn/patch-updates', repo=dict(full_name='AuthorityTech/app'))
+            f['runs'] = [dict(name=name, conclusion='success', check_suite=dict(id=1)) for name in ['delivery-gate', 'live-database-tests', 'lat-check']]
+            f['statuses'] = [dict(context='Railway', state='success')]
+            return f
+
+        for enabled in ['false', 'true']:
+            args = dict(repo='AuthorityTech/app', enabled=enabled, kind='dependabot', required=[])
+            r, merged, calls = self.run_gate(app_fixture(), **args)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertTrue(merged)
+            self.assertFalse(any('/files?' in str(c) or '/dispatches' in str(c) for c in calls))
+            for state in ['absent', 'pending', 'failure', 'error']:
+                f = app_fixture(); f['statuses'] = [] if state == 'absent' else [dict(context='Railway', state=state)]
+                self.assert_held(f, **args)
+            for state in [None, 'failure', 'cancelled', 'timed_out']:
+                f = app_fixture(); f['runs'][0]['conclusion'] = state
+                self.assert_held(f, **args)
+            for field, value in [('draft', True), ('head', dict(sha='c'*40, ref='dependabot/npm_and_yarn/patch-updates', repo=dict(full_name='AuthorityTech/app')))]:
+                f = app_fixture(); f['pr'][field] = value
+                self.assert_held(f, **args)
+            f = app_fixture(); f['rules'] = [dict(type='merge_queue')]
+            r, merged, calls = self.run_gate(f, **args)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertFalse(merged)
+            self.assertTrue(any('labels[]=dependabot-eligible' in c for c in calls))
+            self.assertTrue(any('/issues/1/comments' in str(c) and '-f' in c for c in calls))
+            self.assertFalse(any('/files?' in str(c) or '/dispatches' in str(c) for c in calls))
 
 if __name__ == '__main__': unittest.main()
