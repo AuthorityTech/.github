@@ -10,6 +10,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / '.github/workflows/dependabot-automerge.yml').read_text()
 SCRIPT = textwrap.dedent(SOURCE.split('      - name: Merge once the head commit is green\n', 1)[1].split('        run: |\n', 1)[1])
+RESOLVE = textwrap.dedent(SOURCE.split('      - name: Find the eligible open PRs whose head is this commit\n', 1)[1].split('        run: |\n', 1)[1].split('\n\n  merge:\n', 1)[0])
 HEAD = 'a' * 40
 BASE = 'b' * 40
 REPO = 'Bramwell-Inc/jaxonparrott.com'
@@ -23,6 +24,13 @@ a = sys.argv[1:]
 with (root / 'calls.jsonl').open('a') as log: log.write(json.dumps(a) + '\\n')
 url = next((v for v in a if v.startswith('repos/')), '')
 def output(value): print(json.dumps(value))
+# fail: {url substring: {times, message, write}} answers that many matching calls with a gh error.
+for key, spec in f.get('fail', {}).items():
+    if url and key in url and ('-X' in a) == spec.get('write', False) and spec['times'] > 0:
+        spec['times'] -= 1
+        (root / 'fixture.json').write_text(json.dumps(f))
+        sys.stderr.write('gh: ' + spec.get('message', 'Server Error (HTTP 502)') + '\\n')
+        sys.exit(1)
 if a[:2] == ['pr', 'merge']:
     assert '--match-head-commit' in a and a[a.index('--match-head-commit')+1] == 'a'*40
     assert '--repo' in a and a[a.index('--repo')+1] == os.environ['REPO']
@@ -69,6 +77,7 @@ elif '/check-runs?' in url:
 elif '/status?' in url:
     assert '/commits/' + 'a'*40 + '/' in url
     output({'total_count': f.get('status_count', len(f['statuses'])), 'statuses': f['statuses']})
+elif '/commits/' in url and url.endswith('/pulls'): output(f.get('commit_pulls', []))
 elif '/commits/' in url: output({'parents': [{'sha': 'b'*40}]})
 elif url.count('/') == 2: print('main')
 else: sys.exit('unexpected endpoint: ' + url)
@@ -217,5 +226,63 @@ class PublicationGate(unittest.TestCase):
             self.assertTrue(any('labels[]=dependabot-eligible' in c for c in calls))
             self.assertTrue(any('/issues/1/comments' in str(c) and '-f' in c for c in calls))
             self.assertFalse(any('/files?' in str(c) or '/dispatches' in str(c) for c in calls))
+
+    # 2026-11-04: one HTTP 502 on a read ended the only evaluation website #939's green head got, and
+    # it sat unmerged until a seat re-ran the job. A transient server error must not end an evaluation.
+    def test_a_server_error_on_any_read_is_retried_and_the_head_still_merges(self):
+        baseline = self.run_gate()[2]
+        messages = ['Server Error (HTTP 502)', 'HTTP 503: Service Unavailable',
+                    'Get "https://api.github.com/x": read tcp 10.0.0.1:443: connection reset by peer']
+        for key in ['/rules/branches/', '/pulls/', '/files?', '/status?', '/actions/runs?', '/check-runs?']:
+            for message in messages:
+                f = fixture(); f['fail'] = {key: dict(times=1, message=message)}
+                with self.subTest(key=key, message=message):
+                    r, merged, calls = self.run_gate(f)
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                    self.assertTrue(merged, r.stdout + r.stderr)
+                    self.assertEqual(sum(key in str(c) for c in calls), sum(key in str(c) for c in baseline) + 1)
+                    self.assertEqual(sum('/dispatches' in str(c) for c in calls), 1)
+                    self.assertEqual(sum('-X' in c and 'PUT' in c for c in calls), 1)
+
+    def test_a_server_error_that_persists_fails_the_evaluation_visibly_and_never_merges(self):
+        f = fixture(); f['fail'] = {'/status?': dict(times=99)}
+        r, merged, calls = self.run_gate(f)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(merged)
+        self.assertIn('HTTP 502', r.stderr)
+        self.assertEqual(sum('/status?' in str(c) for c in calls), 4, 'four tries, then the error stands')
+
+    def test_client_errors_and_writes_are_never_retried_by_the_read_wrapper(self):
+        f = fixture(); f['fail'] = {'/status?': dict(times=99, message='Not Found (HTTP 404)')}
+        r, merged, calls = self.run_gate(f)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(merged)
+        self.assertEqual(sum('/status?' in str(c) for c in calls), 1)
+        f = fixture(); f['fail'] = {'/merge': dict(times=1, write=True)}
+        r, merged, calls = self.run_gate(f)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sum('-X' in c and 'PUT' in c for c in calls), 2, "the merge loop's own second try, nothing more")
+        self.assertEqual(sum('/dispatches' in str(c) for c in calls), 1)
+
+    def test_a_recovery_event_survives_a_server_error_while_finding_its_pr(self):
+        pull = dict(number=1, state='open', draft=False, head=dict(sha=HEAD, ref='editorial/post', repo=dict(full_name=REPO)), base=dict(ref='main'))
+        for times in [0, 1]:
+            f = fixture(); f['commit_pulls'] = [pull]; f['fail'] = {'/commits/' + HEAD + '/pulls': dict(times=times)}
+            with tempfile.TemporaryDirectory() as d, self.subTest(times=times):
+                root = Path(d)
+                (root / 'fixture.json').write_text(json.dumps(f))
+                for name, script in [('gh', MOCK), ('sleep', '#!/bin/sh\nexit 0\n')]:
+                    p = root / name; p.write_text(script); p.chmod(0o755)
+                out = root / 'output'
+                env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, GH_TOKEN='local-fixture-only', REPO=REPO, EVENT='workflow_run', PR='', PR_SHA='', PR_AUTHOR='', SHA=HEAD, GITHUB_OUTPUT=str(out))
+                r = subprocess.run(['bash', '-c', RESOLVE], env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual(json.loads(out.read_text().split('prs=', 1)[1]), [dict(number=1, sha=HEAD, kind='editorial')])
+
+    def test_resolve_and_merge_carry_the_same_read_retry(self):
+        def wrapper(script):
+            start = script.index('gh() {')
+            return script[start:script.index('\n}\n', start) + 3]
+        self.assertEqual(wrapper(RESOLVE), wrapper(SCRIPT))
 
 if __name__ == '__main__': unittest.main()
