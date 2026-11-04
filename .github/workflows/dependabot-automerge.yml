@@ -41,8 +41,10 @@ name: Auto-merge Gate (Reusable)
 # an editorial/ branch starts a new evaluation of the open eligible PRs whose
 # head is that commit, so the event that completes the last check is the one that
 # merges. A read that still shows the completing run's own checks unfinished is
-# retried for up to a minute, since no later event may come. Evaluations never
-# supersede or cancel each other, so an editorial PR
+# retried for up to a minute, since no later event may come. For the same reason
+# a read that GitHub answers with a server error (5xx) or a dropped connection is
+# retried for about 20 seconds; a write keeps its own handling and a 4xx is never
+# retried. Evaluations never supersede or cancel each other, so an editorial PR
 # head carries no cancelled or failed gate run. Two evaluations of the same green
 # head can race; GitHub merges once and the other finds the PR merged.
 #
@@ -159,6 +161,27 @@ jobs:
           SHA: ${{ github.event.sha || github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
+          # A read GitHub answers with a server error or a dropped connection is
+          # retried briefly: this evaluation may be the last event its PR gets
+          # (website #939 sat green and unmerged after one 502 on 2026-11-04).
+          # Only reads: a write keeps its own handling, and a 4xx is never retried.
+          # The resolve and merge steps carry this function identically.
+          gh() {
+            local arg read=1 out err try code=0
+            [[ ${1:-} == api ]] || read=0
+            for arg in "$@"; do
+              case $arg in -X*|--method|--method=*|-f|-F|--field|--field=*|--raw-field|--raw-field=*|--input|--input=*) read=0 ;; esac
+            done
+            (( read )) || { command gh "$@"; return; }
+            out=$(mktemp) err=$(mktemp)
+            for try in 1 2 3 4; do
+              if command gh "$@" >"$out" 2>"$err"; then cat "$out"; rm -f "$out" "$err"; return 0; else code=$?; fi
+              grep -qE 'HTTP 5[0-9]{2}|i/o timeout|connection reset|unexpected EOF|TLS handshake timeout' "$err" && (( try < 4 )) || break
+              echo "GitHub answered a read with: $(tr '\n' ' ' <"$err" | head -c 160); retrying." >&2
+              sleep $((try * 3))
+            done
+            cat "$err" >&2; rm -f "$out" "$err"; return "$code"
+          }
           if [[ $EVENT == pull_request_target ]]; then
             kind=editorial
             [[ $PR_AUTHOR == 'dependabot[bot]' ]] && kind=dependabot
@@ -281,6 +304,27 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
+          # A read GitHub answers with a server error or a dropped connection is
+          # retried briefly: this evaluation may be the last event its PR gets
+          # (website #939 sat green and unmerged after one 502 on 2026-11-04).
+          # Only reads: a write keeps its own handling, and a 4xx is never retried.
+          # The resolve and merge steps carry this function identically.
+          gh() {
+            local arg read=1 out err try code=0
+            [[ ${1:-} == api ]] || read=0
+            for arg in "$@"; do
+              case $arg in -X*|--method|--method=*|-f|-F|--field|--field=*|--raw-field|--raw-field=*|--input|--input=*) read=0 ;; esac
+            done
+            (( read )) || { command gh "$@"; return; }
+            out=$(mktemp) err=$(mktemp)
+            for try in 1 2 3 4; do
+              if command gh "$@" >"$out" 2>"$err"; then cat "$out"; rm -f "$out" "$err"; return 0; else code=$?; fi
+              grep -qE 'HTTP 5[0-9]{2}|i/o timeout|connection reset|unexpected EOF|TLS handshake timeout' "$err" && (( try < 4 )) || break
+              echo "GitHub answered a read with: $(tr '\n' ' ' <"$err" | head -c 160); retrying." >&2
+              sleep $((try * 3))
+            done
+            cat "$err" >&2; rm -f "$out" "$err"; return "$code"
+          }
           # The calling workflow's path, e.g. .github/workflows/dependabot-automerge.yml.
           caller="${WORKFLOW_REF#"$REPO/"}"
           caller="${caller%%@*}"
