@@ -332,6 +332,11 @@ jobs:
           # Non-empty when the base merges only through a merge queue, where this
           # gate merges nothing (see the top of this file).
           queue=$(gh api --paginate "repos/$REPO/rules/branches/${BASE_REF:-$base}" --jq '.[] | select(.type == "merge_queue") | .type')
+          # Every status context the base's rules require. GitHub refuses a merge without
+          # them, so this gate requires them too, for both kinds: a missing one is pending.
+          # Otherwise a Dependabot head that is green before such a status is posted gets one
+          # merge GitHub refuses, and no later event evaluates it again.
+          ruled=$(gh api --paginate "repos/$REPO/rules/branches/${BASE_REF:-$base}" --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context' | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
           # Where the PR stands now: merged, closed, moved (head is no longer $SHA),
           # draft, ineligible, or open.
           pr_state() {
@@ -369,7 +374,7 @@ jobs:
               required=$(jq -c 'map(select(. != "Vercel")) + ["agentic-verify", "claims", "portfolio-retired-pointers"] | unique' <<<"$required")
             fi
           }
-          echo "#$PR ($KIND) at $SHA; required: $required"
+          echo "#$PR ($KIND) at $SHA; required: $required; required by the base's rules: $ruled"
           # One read of the head commit. Sets verdict to failed, partial, green or pending.
           read_checks() {
             # Commit statuses: Vercel reports the build here. At least one must
@@ -386,10 +391,10 @@ jobs:
             # Check runs of the completed run that started this evaluation that the
             # API still reports unfinished: a read that lags the event.
             lagging=$(jq --arg suite "${TRIGGER_SUITE:-}" '[.check_runs[] | select($suite != "" and (.check_suite.id | tostring) == $suite and .conclusion == null)] | length' <<<"$runs")
-            # A required name is met only when it is present and every status or
-            # check run carrying it succeeded.
-            unmet=$(jq -nc --argjson req "$required" --argjson s "$statuses" --argjson c "$checks" '
-              [$req[] as $n | ([$s[], $c[]] | map(select(.name == $n))) as $m
+            # A required name, this caller's or the base's rules', is met only when it is
+            # present and every status or check run carrying it succeeded.
+            unmet=$(jq -nc --argjson req "$required" --argjson ruled "$ruled" --argjson s "$statuses" --argjson c "$checks" '
+              [($req + $ruled | unique)[] as $n | ([$s[], $c[]] | map(select(.name == $n))) as $m
                 | select(($m | length) == 0 or any($m[]; .state != "success")) | $n]')
             echo "statuses=$statuses checks=$checks unmet=$unmet"
             waiting=$(jq -nc --argjson s "$statuses" --argjson c "$checks" --argjson u "$unmet" --arg content "$content_only" '

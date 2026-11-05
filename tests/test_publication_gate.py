@@ -48,8 +48,12 @@ if '-X' in a and a[a.index('-X')+1] == 'PUT':
     output({'sha': 'd'*40}); sys.exit(0)
 if url.endswith('/dispatches'): sys.exit(0)
 if '/rules/branches/' in url:
+    expr = a[a.index('--jq') + 1] if '--jq' in a else ''
     for rule in f.get('rules', []):
-        if rule['type'] == 'merge_queue': print('merge_queue')
+        if 'required_status_checks' in expr:
+            if rule['type'] == 'required_status_checks':
+                for check in rule['parameters']['required_status_checks']: print(check['context'])
+        elif rule['type'] == 'merge_queue': print('merge_queue')
 elif '/files?' in url:
     if f.get('file_api_error'): sys.exit(1)
     output(f['files'])
@@ -192,6 +196,29 @@ class PublicationGate(unittest.TestCase):
         self.assertTrue(attempted)
         self.assertIn('moved', r.stdout)
         self.assertFalse(any('/dispatches' in str(c) for c in calls))
+
+    # 2026-11-05: jaxonparrott.com main is to require jp-overlap, a status the Gateway posts within ten
+    # minutes. A Dependabot head is green sooner: the gate tried one merge, GitHub refused it, and no
+    # later event would evaluate that PR again. A context the base's rules require is required here.
+    def test_a_status_the_base_rules_require_holds_either_kind_until_posted(self):
+        rules = [dict(type='required_status_checks', parameters=dict(required_status_checks=[dict(context='jp-overlap')])), dict(type='deletion', parameters=None)]
+        for kind, required in [('editorial', None), ('dependabot', [])]:
+            f = fixture(); f['rules'] = rules; f['statuses'] = [dict(context='Vercel', state='success')]
+            with self.subTest(kind=kind, posted=False):
+                r, calls = self.assert_held(f, kind=kind, required=required)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn('jp-overlap', r.stdout)
+            for state in ['pending', 'failure', 'error']:
+                f = fixture(); f['rules'] = rules; f['statuses'] = [dict(context='Vercel', state='success'), dict(context='jp-overlap', state=state)]
+                with self.subTest(kind=kind, state=state): self.assert_held(f, kind=kind, required=required)
+            f = fixture(); f['rules'] = rules; f['statuses'] = [dict(context='Vercel', state='success'), dict(context='jp-overlap', state='success')]
+            with self.subTest(kind=kind, posted=True):
+                r, merged, calls = self.run_gate(f, kind=kind, required=required)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertTrue(merged, r.stdout)
+        # A base whose rules require nothing changes nothing.
+        f = fixture(); f['rules'] = [dict(type='deletion', parameters=None)]
+        self.assertTrue(self.run_gate(f)[1])
 
     def test_dependabot_still_needs_a_status(self):
         self.assert_held(fixture(), kind='dependabot')
