@@ -219,6 +219,12 @@ class PublicationGate(unittest.TestCase):
         # A base whose rules require nothing changes nothing.
         f = fixture(); f['rules'] = [dict(type='deletion', parameters=None)]
         self.assertTrue(self.run_gate(f)[1])
+        # The rules are read with every read of the checks, so a waiting evaluation sees a rule added meanwhile.
+        f = fixture(); f['rules'] = rules; f['statuses'] = [dict(context='Vercel', state='success')]
+        r, merged, calls = self.run_gate(f, kind='dependabot', required=[])
+        reads = [c for c in calls if any('/rules/branches/' in str(x) for x in c) and 'required_status_checks' in ' '.join(c)]
+        checks = [c for c in calls if any('/check-runs?' in str(x) for x in c)]
+        self.assertEqual(len(reads), len(checks), r.stdout)
 
     def test_dependabot_still_needs_a_status(self):
         self.assert_held(fixture(), kind='dependabot')
