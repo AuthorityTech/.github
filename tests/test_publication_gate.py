@@ -59,8 +59,25 @@ elif '/files?' in url:
     output(f['files'])
 elif url.endswith('/labels/dependabot-eligible'): output({'name': 'dependabot-eligible'})
 elif '/issues/' in url and url.endswith('/labels'): output([{'name': 'dependabot-eligible'}])
-elif '/issues/' in url and url.endswith('/comments'):
-    if '-f' in a: output({'id': 1})
+elif '/issues/comments/' in url and '-X' in a and a[a.index('-X')+1] == 'PATCH':
+    body = next(x.split('=', 1)[1] for x in a if x.startswith('body='))
+    cid = url.rsplit('/', 1)[-1]
+    for c in f.setdefault('comments', []):
+        if str(c.get('id')) == cid: c['body'] = body
+    (root / 'fixture.json').write_text(json.dumps(f))
+    output({'id': int(cid) if cid.isdigit() else 1})
+elif '/issues/' in url and '/comments' in url:
+    if '-f' in a and ('-X' not in a or a[a.index('-X')+1] == 'POST'):
+        body = next(x.split('=', 1)[1] for x in a if x.startswith('body='))
+        comments = f.setdefault('comments', [])
+        cid = max([c.get('id', 0) for c in comments] or [0]) + 1
+        comments.append({'id': cid, 'body': body, 'user': {'login': 'github-actions[bot]'}})
+        (root / 'fixture.json').write_text(json.dumps(f))
+        output({'id': cid})
+    elif '--jq' in a:
+        pass
+    else:
+        output(f.get('comments') or [])
 elif '/pulls/' in url:
     count_file = root / 'reads'
     count = int(count_file.read_text()) if count_file.exists() else 0
@@ -105,9 +122,27 @@ class PublicationGate(unittest.TestCase):
                 p = root / name; p.write_text(script); p.chmod(0o755)
             env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, RUNNER_TEMP=d, GH_TOKEN='local-fixture-only', REPO=repo, PR='1', SHA=HEAD, KIND=kind, REQUIRED='\n'.join(['Vercel', *NAMES] if required is None else required), CONTENT_WITHOUT_PREVIEW=enabled, WORKFLOW_REF=repo + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE=trigger, BASE_REF='main')
             result = subprocess.run(['bash', '-c', SCRIPT], env=env, text=True, capture_output=True, timeout=10)
-            calls = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()]
+            calls = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()] if (root / 'calls.jsonl').exists() else []
             merged = any(('-X' in c and 'PUT' in c) or c[:2] == ['pr', 'merge'] for c in calls)
             return result, merged, calls
+
+    def run_rounds(self, f=None, rounds=2, repo=REPO, enabled='true', kind='editorial', required=None, trigger=''):
+        f = f or fixture()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'fixture.json').write_text(json.dumps(f))
+            for name, script in [('gh', MOCK), ('sleep', '#!/bin/sh\nexit 0\n')]:
+                p = root / name; p.write_text(script); p.chmod(0o755)
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, RUNNER_TEMP=d, GH_TOKEN='local-fixture-only', REPO=repo, PR='1', SHA=HEAD, KIND=kind, REQUIRED='\n'.join(['Vercel', *NAMES] if required is None else required), CONTENT_WITHOUT_PREVIEW=enabled, WORKFLOW_REF=repo + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE=trigger, BASE_REF='main')
+            out = []
+            for _ in range(rounds):
+                log = root / 'calls.jsonl'
+                if log.exists(): log.unlink()
+                result = subprocess.run(['bash', '-c', SCRIPT], env=env, text=True, capture_output=True, timeout=10)
+                calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+                merged = any(('-X' in c and 'PUT' in c) or c[:2] == ['pr', 'merge'] for c in calls)
+                out.append((result, merged, calls))
+            return out, json.loads((root / 'fixture.json').read_text())
 
     def assert_held(self, f, **kwargs):
         result, merged, calls = self.run_gate(f, **kwargs)
@@ -332,8 +367,16 @@ class PublicationGate(unittest.TestCase):
             ])
             return f
 
-        def advised(calls):
-            return any('automerge-page-check-unjudged' in ' '.join(c) for c in calls)
+        def note_writes(calls):
+            writes = []
+            for c in calls:
+                if not any(x.startswith('body=') and 'automerge-page-check-unjudged' in x for x in c):
+                    continue
+                if '-X' in c and c[c.index('-X')+1] == 'PATCH':
+                    writes.append('PATCH')
+                else:
+                    writes.append('POST')
+            return writes
 
         def ready(repo, required):
             f = benign(fixture())
@@ -358,13 +401,13 @@ class PublicationGate(unittest.TestCase):
             with self.subTest(repo=repo, judged=True):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(merged, result.stdout)
-                self.assertFalse(advised(calls), result.stdout)
+                self.assertEqual(note_writes(calls), [])
             f = drop_page(ready(repo, required))
             result, merged, calls = self.run_gate(f, repo=repo, required=required)
             with self.subTest(repo=repo, judged=False):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(merged, result.stdout)
-                self.assertTrue(advised(calls), result.stdout + result.stderr)
+                self.assertEqual(note_writes(calls), ['POST'])
                 self.assertIn('did not judge', result.stdout)
         # Vercel first or later is the same signal. A missing run is noted, not held.
         for required in (['Vercel', 'portfolio-retired-pointers'], ['portfolio-retired-pointers', 'Vercel']):
@@ -372,7 +415,7 @@ class PublicationGate(unittest.TestCase):
             result, merged, calls = self.run_gate(f, repo='Bramwell-Inc/presspool.ai', required=required)
             with self.subTest(required=required):
                 self.assertTrue(merged, result.stdout + result.stderr)
-                self.assertTrue(advised(calls))
+                self.assertEqual(note_writes(calls), ['POST'])
         # Skipped and neutral are terminal and unjudged: merge, with a note.
         # Still running waits. A finished failure, the blocking case, does not merge.
         for state in ('skipped', 'neutral'):
@@ -380,39 +423,39 @@ class PublicationGate(unittest.TestCase):
             with self.subTest(state=state):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(merged, result.stdout)
-                self.assertTrue(advised(calls))
+                self.assertEqual(note_writes(calls), ['POST'])
         result, merged, calls = self.run_gate(benign(set_page(fixture(), None)))
         self.assertFalse(merged, result.stdout)
         self.assertIn('waiting', result.stdout)
-        self.assertFalse(advised(calls))
+        self.assertEqual(note_writes(calls), [])
         result, merged, calls = self.run_gate(benign(set_page(fixture(), 'failure')))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(merged, result.stdout)
         self.assertIn('a check failed', result.stdout)
-        self.assertFalse(advised(calls))
+        self.assertEqual(note_writes(calls), [])
         # Success, including the job's own not-judged success, merges with no note.
         # A path-filter skip beside it is not that note.
         result, merged, calls = self.run_gate(benign(fixture()))
         self.assertTrue(merged, result.stdout)
-        self.assertFalse(advised(calls))
+        self.assertEqual(note_writes(calls), [])
         self.assertIn('content_only=true', result.stdout)
         # The workflow name is not the check run. Absent page-check is noted, not held.
         f = drop_page(fixture())
         f['runs'].append(dict(name='Page check', conclusion='success', check_suite=dict(id=3)))
         result, merged, calls = self.run_gate(f)
         self.assertTrue(merged, result.stdout + result.stderr)
-        self.assertTrue(advised(calls))
+        self.assertEqual(note_writes(calls), ['POST'])
         # Writing page-check into the required list is still a presence hold.
         # This gate does not write it there.
         f = drop_page(ready('Bramwell-Inc/presspool.ai', ['Vercel', 'page-check']))
         result, calls = self.assert_held(f, repo='Bramwell-Inc/presspool.ai', required=['Vercel', 'page-check'])
         self.assertIn('page-check', result.stdout)
-        self.assertFalse(advised(calls))
+        self.assertEqual(note_writes(calls), [])
         # An existing required check still holds when page-check succeeded.
         f = benign(fixture())
         next(c for c in f['runs'] if c['name'] == 'portfolio-retired-pointers')['conclusion'] = 'skipped'
         result, calls = self.assert_held(f)
-        self.assertFalse(advised(calls))
+        self.assertEqual(note_writes(calls), [])
         # A code change still needs the preview.
         f = benign(fixture())
         f['files'].append(dict(filename='src/proxy.ts', status='modified'))
@@ -421,14 +464,16 @@ class PublicationGate(unittest.TestCase):
         f['statuses'] = [dict(context='Vercel', state='success')]
         result, merged, calls = self.run_gate(f)
         self.assertTrue(merged, result.stdout)
-        self.assertFalse(advised(calls))
-        # The note is best-effort. A failed comment still merges.
+        self.assertEqual(note_writes(calls), [])
+        # A failed lookup posts nothing and still merges, so a retry cannot add a second note.
         f = drop_page(fixture())
-        f['fail'] = {'/comments': dict(times=5, message='Server Error (HTTP 502)')}
+        f['comments'] = [dict(id=7, body='<!-- automerge-page-check-unjudged -->\nold', user=dict(login='github-actions[bot]'))]
+        f['fail'] = {'/comments': dict(times=4, message='Server Error (HTTP 502)')}
         result, merged, calls = self.run_gate(f)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(merged, result.stdout + result.stderr)
-        self.assertIn('note was not posted', result.stdout)
+        self.assertIn('could not be read', result.stdout)
+        self.assertEqual(note_writes(calls), [])
         # No Vercel in the required list, and Dependabot, are not noted or held.
         f = fixture()
         f['pr']['head']['repo']['full_name'] = 'AuthorityTech/app'
@@ -449,13 +494,76 @@ class PublicationGate(unittest.TestCase):
             with self.subTest(kind=kind, required=required):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(merged, result.stdout + result.stderr)
-                self.assertFalse(advised(calls))
+                self.assertEqual(note_writes(calls), [])
         result, merged, calls = self.run_gate(f, repo='AuthorityTech/app', required=['vercel'])
         before = result.stdout.split('checks=', 1)[0]
         self.assertFalse(merged, result.stdout)
         self.assertIn('required: ["vercel"]', before)
         self.assertNotIn('page-check', before)
-        self.assertFalse(advised(calls))
+        self.assertEqual(note_writes(calls), [])
+
+    def test_page_check_note_is_idempotent_and_does_not_claim_the_merge(self):
+        mark = '<!-- automerge-page-check-unjudged -->'
+        sentence = 'Auto-merge gate: Page check did not judge ' + SOURCE.split('Auto-merge gate: Page check did not judge ', 1)[1].split('"', 1)[0]
+        self.assertNotIn('when this merged', SOURCE)
+        current = sentence.replace('${SHA}', HEAD)
+        note = mark + '\n' + current
+
+        def writes(calls):
+            out = []
+            for c in calls:
+                body = next((x.split('=', 1)[1] for x in c if x.startswith('body=') and mark in x), None)
+                if body is None:
+                    continue
+                method = 'PATCH' if '-X' in c and c[c.index('-X')+1] == 'PATCH' else 'POST'
+                out.append((method, body))
+            return out
+
+        def bare():
+            f = fixture()
+            f['runs'] = [c for c in f['runs'] if c['name'] != 'page-check']
+            return f
+
+        rounds, stored = self.run_rounds(bare(), rounds=2)
+        self.assertEqual(writes(rounds[0][2]), [('POST', note)])
+        self.assertEqual(writes(rounds[1][2]), [])
+        self.assertEqual(stored['comments'], [dict(id=1, body=note, user=dict(login='github-actions[bot]'))])
+        for result, merged, _ in rounds:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(merged, result.stdout)
+
+        same = bare()
+        same['comments'] = [dict(id=4, body=note, user=dict(login='github-actions[bot]'))]
+        rounds, stored = self.run_rounds(same, rounds=2)
+        self.assertEqual(writes(rounds[0][2]), [])
+        self.assertEqual(writes(rounds[1][2]), [])
+        self.assertEqual(stored['comments'][0]['body'], note)
+
+        changed = bare()
+        changed['comments'] = [dict(id=9, body=mark + '\nprevious wording', user=dict(login='github-actions[bot]'))]
+        rounds, stored = self.run_rounds(changed, rounds=2)
+        self.assertEqual(writes(rounds[0][2]), [('PATCH', note)])
+        self.assertEqual(writes(rounds[1][2]), [])
+        self.assertEqual([c['body'] for c in stored['comments']], [note])
+
+        missed = bare()
+        missed['comments'] = [dict(id=7, body=mark + '\nstill the only note', user=dict(login='github-actions[bot]'))]
+        missed['fail'] = {'/comments': dict(times=4, message='Server Error (HTTP 502)')}
+        result, merged, calls = self.run_gate(missed)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(merged, result.stdout)
+        self.assertEqual(writes(calls), [])
+        self.assertIn('could not be read', result.stdout)
+
+        refused = bare()
+        refused['refuse_merge'] = True
+        result, attempted, calls = self.run_gate(refused)
+        self.assertTrue(attempted)
+        self.assertIn('moved', result.stdout)
+        self.assertFalse(any('/dispatches' in str(c) for c in calls))
+        self.assertEqual(writes(calls), [('POST', note)])
+        self.assertNotIn('when this merged', writes(calls)[0][1])
+        self.assertNotIn('when this merged', result.stdout)
 
     def test_resolve_and_merge_carry_the_same_read_retry(self):
         def wrapper(script):
