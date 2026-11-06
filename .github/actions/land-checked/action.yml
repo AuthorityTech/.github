@@ -1,0 +1,36 @@
+name: Land checked
+description: >-
+  Fast-forwards main to HEAD only once that exact commit's Vercel status is success: pushes it
+  to a land/ branch, waits for Vercel there, then pushes main. When main moved meanwhile, it
+  rebases and builds again. The caller needs contents write and statuses read.
+
+inputs:
+  build-minutes:
+    description: Longest wait for one Vercel build.
+    default: "15"
+  rounds:
+    description: Builds to try, rebasing onto main each time main moved during one.
+    default: "6"
+  after-rebase:
+    description: Shell commands run after each rebase onto a moved main; a failure stops the landing.
+    default: ""
+
+outputs:
+  sha:
+    description: The commit main now points at.
+    value: ${{ steps.land.outputs.sha }}
+  landed:
+    description: '"true" once main points at sha.'
+    value: ${{ steps.land.outputs.landed }}
+
+runs:
+  using: composite
+  steps:
+    - id: land
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        BUILD_MINUTES: ${{ inputs.build-minutes }}
+        ROUNDS: ${{ inputs.rounds }}
+        AFTER_REBASE: ${{ inputs.after-rebase }}
+      run: bash "$GITHUB_ACTION_PATH/land.sh"
