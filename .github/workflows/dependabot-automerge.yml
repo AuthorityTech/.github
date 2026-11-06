@@ -365,9 +365,10 @@ jobs:
           if [[ $KIND == editorial ]]; then
             required=$(printf '%s\n' "$REQUIRED" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | jq -Rsc 'split("\n") | map(select(length > 0))')
             # Listing Vercel is the editorial site contract. Require page-check from
-            # that list, before the routine path removes Vercel. jq -e treats 0 as
-            # false, and Vercel is the first name every current caller lists, so the
-            # test is != null. The opt-out suppresses only this inference.
+            # that list, before the routine path removes Vercel. index is 0 when
+            # Vercel is first and null when it is absent. jq -e treats 0 as true,
+            # and != null is the presence test. The opt-out suppresses only this
+            # inference.
             if [[ ${SKIP_PAGE_CHECK:-false} != true ]] && jq -e 'index("Vercel") != null' >/dev/null <<<"$required"; then
               required=$(jq -c '. + ["page-check"] | unique' <<<"$required")
             fi

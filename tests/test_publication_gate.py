@@ -364,7 +364,7 @@ class PublicationGate(unittest.TestCase):
             with self.subTest(repo=repo, present=False):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn('page-check', result.stdout)
-        # Vercel first (index 0) and Vercel later both count. jq -e on 0 must not miss it.
+        # Vercel first (index 0) and Vercel later both count.
         for required in (['Vercel', 'portfolio-retired-pointers'], ['portfolio-retired-pointers', 'Vercel']):
             f = drop_page(fixture())
             f['statuses'] = [dict(context='Vercel', state='success')]
