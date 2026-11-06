@@ -96,14 +96,14 @@ def fixture():
     )
 
 class PublicationGate(unittest.TestCase):
-    def run_gate(self, f=None, repo=REPO, enabled='true', kind='editorial', required=None, trigger='', skip_page_check='false'):
+    def run_gate(self, f=None, repo=REPO, enabled='true', kind='editorial', required=None, trigger=''):
         f = f or fixture()
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / 'fixture.json').write_text(json.dumps(f))
             for name, script in [('gh', MOCK), ('sleep', '#!/bin/sh\nexit 0\n')]:
                 p = root / name; p.write_text(script); p.chmod(0o755)
-            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, RUNNER_TEMP=d, GH_TOKEN='local-fixture-only', REPO=repo, PR='1', SHA=HEAD, KIND=kind, REQUIRED='\n'.join(['Vercel', *NAMES] if required is None else required), SKIP_PAGE_CHECK=skip_page_check, CONTENT_WITHOUT_PREVIEW=enabled, WORKFLOW_REF=repo + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE=trigger, BASE_REF='main')
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, RUNNER_TEMP=d, GH_TOKEN='local-fixture-only', REPO=repo, PR='1', SHA=HEAD, KIND=kind, REQUIRED='\n'.join(['Vercel', *NAMES] if required is None else required), CONTENT_WITHOUT_PREVIEW=enabled, WORKFLOW_REF=repo + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE=trigger, BASE_REF='main')
             result = subprocess.run(['bash', '-c', SCRIPT], env=env, text=True, capture_output=True, timeout=10)
             calls = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()]
             merged = any(('-X' in c and 'PUT' in c) or c[:2] == ['pr', 'merge'] for c in calls)
@@ -312,10 +312,10 @@ class PublicationGate(unittest.TestCase):
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
                 self.assertEqual(json.loads(out.read_text().split('prs=', 1)[1]), [dict(number=1, sha=HEAD, kind='editorial')])
 
-    # Listing the context Vercel is the editorial site contract. It requires the check
-    # run page-check. A caller that does not list that context is not caught, nor is
-    # Dependabot. Not judged is a success conclusion. A path-filter skip stays a pass.
-    def test_vercel_contract_requires_page_check_and_other_callers_are_not_caught(self):
+    # Listing Vercel does not make a missing or skipped page-check a hold. It notes
+    # that the run did not judge, and merges. A finished failure still stops the merge.
+    # A caller that does not list Vercel, and Dependabot, get neither note nor hold.
+    def test_unavailable_page_check_is_noted_and_a_finished_failure_still_holds(self):
         def drop_page(f):
             f['runs'] = [c for c in f['runs'] if c['name'] != 'page-check']
             return f
@@ -332,7 +332,18 @@ class PublicationGate(unittest.TestCase):
             ])
             return f
 
-        # The seven callers, as their workflows list the names. Vercel is first on each.
+        def advised(calls):
+            return any('automerge-page-check-unjudged' in ' '.join(c) for c in calls)
+
+        def ready(repo, required):
+            f = benign(fixture())
+            f['pr']['head']['repo']['full_name'] = repo
+            if repo == REPO:
+                f['statuses'] = [dict(context='jp-overlap', state='success')]
+            else:
+                f['statuses'] = [dict(context='Vercel', state='success')]
+            return f
+
         callers = [
             ('AuthorityTech/website', ['Vercel', 'portfolio-retired-pointers']),
             ('AuthorityTech/christianlehman.com', ['Vercel', 'portfolio-retired-pointers']),
@@ -343,78 +354,83 @@ class PublicationGate(unittest.TestCase):
             ('Bramwell-Inc/jaxonparrott.com', ['Vercel', 'agentic-verify', 'portfolio-retired-pointers', 'claims', 'jp-overlap']),
         ]
         for repo, required in callers:
-            f = benign(fixture())
-            f['pr']['head']['repo']['full_name'] = repo
-            if repo == REPO:
-                f['statuses'] = [dict(context='jp-overlap', state='success')]
-            else:
-                f['statuses'] = [dict(context='Vercel', state='success')]
-            result, merged, _ = self.run_gate(f, repo=repo, required=required)
-            with self.subTest(repo=repo, present=True):
+            result, merged, calls = self.run_gate(ready(repo, required), repo=repo, required=required)
+            with self.subTest(repo=repo, judged=True):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(merged, result.stdout)
-                self.assertIn('page-check', result.stdout)
-            f = drop_page(fixture())
-            f['pr']['head']['repo']['full_name'] = repo
-            if repo == REPO:
-                f['statuses'] = [dict(context='jp-overlap', state='success')]
-            else:
-                f['statuses'] = [dict(context='Vercel', state='success')]
-            result, calls = self.assert_held(f, repo=repo, required=required)
-            with self.subTest(repo=repo, present=False):
+                self.assertFalse(advised(calls), result.stdout)
+            f = drop_page(ready(repo, required))
+            result, merged, calls = self.run_gate(f, repo=repo, required=required)
+            with self.subTest(repo=repo, judged=False):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn('page-check', result.stdout)
-        # Vercel first (index 0) and Vercel later both count.
+                self.assertTrue(merged, result.stdout)
+                self.assertTrue(advised(calls), result.stdout + result.stderr)
+                self.assertIn('did not judge', result.stdout)
+        # Vercel first or later is the same signal. A missing run is noted, not held.
         for required in (['Vercel', 'portfolio-retired-pointers'], ['portfolio-retired-pointers', 'Vercel']):
-            f = drop_page(fixture())
-            f['statuses'] = [dict(context='Vercel', state='success')]
-            f['pr']['head']['repo']['full_name'] = 'Bramwell-Inc/presspool.ai'
+            f = drop_page(ready('Bramwell-Inc/presspool.ai', required))
+            result, merged, calls = self.run_gate(f, repo='Bramwell-Inc/presspool.ai', required=required)
             with self.subTest(required=required):
-                self.assert_held(f, repo='Bramwell-Inc/presspool.ai', required=required)
-        # Missing, still running, skipped, neutral and a blocking failure hold.
-        # The gate job stays green. Success, including not judged, merges, and a
-        # path-filter skip beside it still merges. The routine path keeps page-check.
-        for state, notice in [('skipped', 'waiting'), ('neutral', 'waiting'), (None, 'waiting'), ('failure', 'a check failed')]:
-            f = benign(set_page(fixture(), state))
-            result, merged, _ = self.run_gate(f)
+                self.assertTrue(merged, result.stdout + result.stderr)
+                self.assertTrue(advised(calls))
+        # Skipped and neutral are terminal and unjudged: merge, with a note.
+        # Still running waits. A finished failure, the blocking case, does not merge.
+        for state in ('skipped', 'neutral'):
+            result, merged, calls = self.run_gate(benign(set_page(fixture(), state)))
             with self.subTest(state=state):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertFalse(merged, result.stdout)
-                self.assertIn(notice, result.stdout)
-                self.assertIn('page-check', result.stdout)
-        f = benign(fixture())
-        result, merged, _ = self.run_gate(f)
+                self.assertTrue(merged, result.stdout)
+                self.assertTrue(advised(calls))
+        result, merged, calls = self.run_gate(benign(set_page(fixture(), None)))
+        self.assertFalse(merged, result.stdout)
+        self.assertIn('waiting', result.stdout)
+        self.assertFalse(advised(calls))
+        result, merged, calls = self.run_gate(benign(set_page(fixture(), 'failure')))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(merged, result.stdout)
+        self.assertIn('a check failed', result.stdout)
+        self.assertFalse(advised(calls))
+        # Success, including the job's own not-judged success, merges with no note.
+        # A path-filter skip beside it is not that note.
+        result, merged, calls = self.run_gate(benign(fixture()))
         self.assertTrue(merged, result.stdout)
+        self.assertFalse(advised(calls))
         self.assertIn('content_only=true', result.stdout)
-        # The workflow name is not the check run.
+        # The workflow name is not the check run. Absent page-check is noted, not held.
         f = drop_page(fixture())
         f['runs'].append(dict(name='Page check', conclusion='success', check_suite=dict(id=3)))
-        result, _ = self.assert_held(f)
+        result, merged, calls = self.run_gate(f)
+        self.assertTrue(merged, result.stdout + result.stderr)
+        self.assertTrue(advised(calls))
+        # Writing page-check into the required list is still a presence hold.
+        # This gate does not write it there.
+        f = drop_page(ready('Bramwell-Inc/presspool.ai', ['Vercel', 'page-check']))
+        result, calls = self.assert_held(f, repo='Bramwell-Inc/presspool.ai', required=['Vercel', 'page-check'])
         self.assertIn('page-check', result.stdout)
-        # An existing required check still holds when page-check is green.
+        self.assertFalse(advised(calls))
+        # An existing required check still holds when page-check succeeded.
         f = benign(fixture())
         next(c for c in f['runs'] if c['name'] == 'portfolio-retired-pointers')['conclusion'] = 'skipped'
-        self.assert_held(f)
+        result, calls = self.assert_held(f)
+        self.assertFalse(advised(calls))
         # A code change still needs the preview.
         f = benign(fixture())
         f['files'].append(dict(filename='src/proxy.ts', status='modified'))
         f['pr']['changed_files'] = 2
         self.assert_held(f)
         f['statuses'] = [dict(context='Vercel', state='success')]
-        result, merged, _ = self.run_gate(f)
+        result, merged, calls = self.run_gate(f)
         self.assertTrue(merged, result.stdout)
-        # Opt-out suppresses the inference and leaves an explicit page-check in place.
-        f = benign(set_page(fixture(), 'skipped'))
-        f['statuses'] = [dict(context='Vercel', state='success')]
-        result, merged, _ = self.run_gate(f, required=['Vercel'], skip_page_check='true')
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue(merged, result.stdout)
-        f = benign(set_page(fixture(), 'skipped'))
-        self.assert_held(f, required=['Vercel', 'page-check'], skip_page_check='true')
-        # A Vercel status, or a differently named check, is not the contract.
-        # Dependabot ignores the editorial list. The app lists neither.
+        self.assertFalse(advised(calls))
+        # The note is best-effort. A failed comment still merges.
         f = drop_page(fixture())
+        f['fail'] = {'/comments': dict(times=5, message='Server Error (HTTP 502)')}
+        result, merged, calls = self.run_gate(f)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(merged, result.stdout + result.stderr)
+        self.assertIn('note was not posted', result.stdout)
+        # No Vercel in the required list, and Dependabot, are not noted or held.
+        f = fixture()
         f['pr']['head']['repo']['full_name'] = 'AuthorityTech/app'
         f['statuses'] = [dict(context='Vercel', state='success')]
         f['runs'] = [
@@ -429,17 +445,17 @@ class PublicationGate(unittest.TestCase):
             ('editorial', []),
             ('dependabot', ['Vercel', *NAMES]),
         ]:
-            result, merged, _ = self.run_gate(f, repo='AuthorityTech/app', kind=kind, required=required)
+            result, merged, calls = self.run_gate(f, repo='AuthorityTech/app', kind=kind, required=required)
             with self.subTest(kind=kind, required=required):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(merged, result.stdout + result.stderr)
-        # A different spelling is a listed name of its own, and it does not infer page-check.
-        result, merged, _ = self.run_gate(f, repo='AuthorityTech/app', required=['vercel'])
+                self.assertFalse(advised(calls))
+        result, merged, calls = self.run_gate(f, repo='AuthorityTech/app', required=['vercel'])
         before = result.stdout.split('checks=', 1)[0]
         self.assertFalse(merged, result.stdout)
         self.assertIn('required: ["vercel"]', before)
         self.assertNotIn('page-check', before)
-        self.assertIn('unmet=["vercel"]', result.stdout)
+        self.assertFalse(advised(calls))
 
     def test_resolve_and_merge_carry_the_same_read_retry(self):
         def wrapper(script):
