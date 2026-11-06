@@ -6,6 +6,8 @@ on:
       - .github/workflows/dependabot-automerge.yml
       - .github/workflows/gate-tests.yml
       - tests/test_publication_gate.py
+      - .github/actions/land-checked/**
+      - tests/test_land_checked.py
 
 permissions:
   contents: read
