@@ -23,14 +23,16 @@ name: Auto-merge Gate (Reusable)
 #   Listed, it holds every editorial PR outside its paths forever, and each
 #   evaluation of that PR exits successfully, so nothing shows it is stuck.
 #
-# page-check is the check run of the workflow named Page check. A site opts in
-# by listing page-check above. The workflow name matches nothing: it is only the
-# workflow_run entry. Listed, the run must be present and success. Skipped,
-# neutral, pending and missing do not meet it. A success does meet it when that
-# job's own result is not judged, the pass it uses when it cannot read the pages;
-# this gate does not turn that pass into a block. Unlisted, a skipped or neutral
-# run stays a pass. That is a path filter such as indexnow or site-integrity, and
-# it is not a failure. Leave page-check off a caller that is not a site.
+# An editorial caller that lists the context Vercel also requires the check run
+# page-check. That is the job id of the workflow named Page check. The workflow
+# name is only the workflow_run entry and matches no check run. The requirement
+# is taken from the caller's list before the routine-publication path removes
+# Vercel, so a routine post keeps it. Skipped, neutral, pending and missing do
+# not meet it. A success does, including a run that job calls not judged.
+# editorial-skip-page-check is the rare opt-out for a caller that lists Vercel
+# and is not covered by that workflow. A caller that does not list Vercel is
+# unchanged, and so is Dependabot. An unlisted skipped or neutral run stays a
+# pass. indexnow and site-integrity are path filters, not failures.
 #
 # Jaxon can opt routine posts and retired-pages data out of requiring a preview
 # status. The API file list must be complete and stable at the judged head; all
@@ -123,10 +125,15 @@ on:
         type: boolean
         default: false
       editorial-required-checks:
-        description: Newline-separated check run names or commit status contexts that must be present and successful before an editorial PR merges. Skipped, neutral, pending and missing do not meet a listed name. List only names every editorial PR produces, from workflows with no pull_request paths filter; a path-filtered check blocks whenever it runs without being listed, and listing one holds every editorial PR outside its paths. The page check's run is page-check, not the workflow name Page check. A success meets it, including a run that job calls not judged. Leave it off a caller that is not a site.
+        description: Newline-separated check run names or commit status contexts that must be present and successful before an editorial PR merges. Skipped, neutral, pending and missing do not meet a listed name. List only names every editorial PR produces, from workflows with no pull_request paths filter; a path-filtered check blocks whenever it runs without being listed, and listing one holds every editorial PR outside its paths. Listing the context Vercel also requires the check run page-check, unless editorial-skip-page-check is true. A success meets page-check, including a run that job calls not judged. The workflow name Page check is not that run.
         required: false
         type: string
         default: ""
+      editorial-skip-page-check:
+        description: Rare opt-out. A caller that lists Vercel but must not require the page-check run. Does not change Dependabot, and does not treat any other skipped or neutral check as a failure.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -302,6 +309,7 @@ jobs:
           SHA: ${{ matrix.pr.sha }}
           KIND: ${{ matrix.pr.kind }}
           REQUIRED: ${{ inputs.editorial-required-checks }}
+          SKIP_PAGE_CHECK: ${{ inputs.editorial-skip-page-check }}
           CONTENT_WITHOUT_PREVIEW: ${{ inputs.editorial-content-without-preview }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WAIT_MINUTES: ${{ inputs.wait-minutes }}
@@ -356,6 +364,13 @@ jobs:
           required='[]'
           if [[ $KIND == editorial ]]; then
             required=$(printf '%s\n' "$REQUIRED" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | jq -Rsc 'split("\n") | map(select(length > 0))')
+            # Listing Vercel is the editorial site contract. Require page-check from
+            # that list, before the routine path removes Vercel. jq -e treats 0 as
+            # false, and Vercel is the first name every current caller lists, so the
+            # test is != null. The opt-out suppresses only this inference.
+            if [[ ${SKIP_PAGE_CHECK:-false} != true ]] && jq -e 'index("Vercel") != null' >/dev/null <<<"$required"; then
+              required=$(jq -c '. + ["page-check"] | unique' <<<"$required")
+            fi
           fi
           content_only=false
           classify_publication() {
