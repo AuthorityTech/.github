@@ -23,6 +23,15 @@ name: Auto-merge Gate (Reusable)
 #   Listed, it holds every editorial PR outside its paths forever, and each
 #   evaluation of that PR exits successfully, so nothing shows it is stuck.
 #
+# page-check is the check run of the workflow named Page check. A site opts in
+# by listing page-check above. The workflow name matches nothing: it is only the
+# workflow_run entry. Listed, the run must be present and success. Skipped,
+# neutral, pending and missing do not meet it. A success does meet it when that
+# job's own result is not judged, the pass it uses when it cannot read the pages;
+# this gate does not turn that pass into a block. Unlisted, a skipped or neutral
+# run stays a pass. That is a path filter such as indexnow or site-integrity, and
+# it is not a failure. Leave page-check off a caller that is not a site.
+#
 # Jaxon can opt routine posts and retired-pages data out of requiring a preview
 # status. The API file list must be complete and stable at the judged head; all
 # three unconditional CI checks remain required. Every present status/check
@@ -114,7 +123,7 @@ on:
         type: boolean
         default: false
       editorial-required-checks:
-        description: Newline-separated check run names or commit status contexts that must be present and successful before an editorial PR merges. List only names every editorial PR produces, from workflows with no pull_request paths filter; a path-filtered check blocks whenever it runs without being listed.
+        description: Newline-separated check run names or commit status contexts that must be present and successful before an editorial PR merges. Skipped, neutral, pending and missing do not meet a listed name. List only names every editorial PR produces, from workflows with no pull_request paths filter; a path-filtered check blocks whenever it runs without being listed, and listing one holds every editorial PR outside its paths. The page check's run is page-check, not the workflow name Page check. A success meets it, including a run that job calls not judged. Leave it off a caller that is not a site.
         required: false
         type: string
         default: ""
@@ -393,7 +402,11 @@ jobs:
             # API still reports unfinished: a read that lags the event.
             lagging=$(jq --arg suite "${TRIGGER_SUITE:-}" '[.check_runs[] | select($suite != "" and (.check_suite.id | tostring) == $suite and .conclusion == null)] | length' <<<"$runs")
             # A required name, this caller's or the base's rules', is met only when it is
-            # present and every status or check run carrying it succeeded.
+            # present and every status or check run carrying it succeeded. Skipped and
+            # neutral do not meet it. A run that is not listed may be skipped or neutral:
+            # a path filter does that, and it is a pass. page-check is the check run of the
+            # workflow named Page check. A success meets a listed page-check, including one
+            # that job calls not judged.
             unmet=$(jq -nc --argjson req "$required" --argjson ruled "$ruled" --argjson s "$statuses" --argjson c "$checks" '
               [($req + $ruled | unique)[] as $n | ([$s[], $c[]] | map(select(.name == $n))) as $m
                 | select(($m | length) == 0 or any($m[]; .state != "success")) | $n]')
