@@ -58,7 +58,8 @@ name: Auto-merge Gate (Reusable)
 # retried for about 20 seconds; a write keeps its own handling and a 4xx is never
 # retried. Evaluations never supersede or cancel each other, so an editorial PR
 # head carries no cancelled or failed gate run. Two evaluations of the same green
-# head can race; GitHub merges once and the other finds the PR merged.
+# head can race: GitHub merges once, and the other is either refused and finds the
+# PR merged, or told that its own merge succeeded too, with the same commit.
 #
 # Dependabot PRs are evaluated only on their own pull_request events, so one
 # evaluation waits up to wait-minutes for the checks, and a newer one cancels the
@@ -80,10 +81,21 @@ name: Auto-merge Gate (Reusable)
 # metadata, file contents through the API, commit statuses and check runs only.
 #
 # A merge made with GITHUB_TOKEN starts no push-triggered workflow, but GitHub
-# does run a repository_dispatch it sends. So the evaluation whose merge of an
+# does run a repository_dispatch it sends. So one evaluation whose merge of an
 # editorial PR succeeded sends one repository_dispatch event, editorial-merged,
 # with client_payload {before, after, pr}: the default branch moved from before
-# to after, the squash commit. A site workflow that does something after a merge
+# to after, the squash commit. A successful merge is not ownership: GitHub told
+# two concurrent evaluations of jaxonparrott.com #202 that each had merged it,
+# with the same commit, and both sent the event. So an evaluation whose merge
+# succeeded first creates the ref refs/editorial-merged/<after>, with the
+# contents: write the merge already uses. GitHub creates a ref only once: the
+# evaluation that creates it sends the event, and one refused because the ref
+# already exists leaves it to that one. A claim that fails for any other reason
+# is retried briefly, then the event is sent anyway with a warning, since a
+# duplicate is better than a lost one. The refs stay: each points at a commit the
+# default branch already holds, no ruleset or workflow trigger matches refs
+# outside refs/heads and refs/tags, and deleting one would let a late evaluation
+# claim its merge again. A site workflow that does something after a merge
 # (search indexing, generated files) subscribes to it and calls
 # editorial-merge-paths.yml, which applies that workflow's own push paths to
 # before..after. A workflow on deployment_status needs neither: Vercel's
@@ -492,7 +504,23 @@ jobs:
                             -f commit_title="$title (#$PR)" 2>"$RUNNER_TEMP/merge.err"); then
                 after=$(jq -r .sha <<<"$merged")
                 echo "::notice::Merged #$PR at its judged head $SHA; merge commit $after."
-                # Only this evaluation merged it, so only this one sends the dispatch.
+                # A successful merge is not ownership; the evaluation that creates the claim
+                # ref sends the dispatch (see the top of this file).
+                claim="refs/editorial-merged/$after"
+                claimed=false
+                for try in 1 2 3; do
+                  if gh api -X POST "repos/$REPO/git/refs" -f ref="$claim" -f sha="$after" >/dev/null 2>"$RUNNER_TEMP/claim.err"; then
+                    claimed=true
+                    break
+                  elif grep -q 'Reference already exists' "$RUNNER_TEMP/claim.err"; then
+                    # After a failed try, the ref may be this evaluation's own claim.
+                    (( try > 1 )) && break
+                    echo "::notice::#$PR is merged at $after; a concurrent evaluation claimed $claim, so that one sends editorial-merged."
+                    exit 0
+                  fi
+                  (( try == 3 )) || sleep $((try * 3))
+                done
+                [[ $claimed == true ]] || echo "::warning::#$PR is merged at $after, but $claim could not be claimed: $(tr '\n' ' ' <"$RUNNER_TEMP/claim.err" | head -c 160). Sending editorial-merged anyway; it may arrive twice."
                 before=$(gh api "repos/$REPO/commits/$after" --jq '.parents[0].sha')
                 payload=$(jq -nc --arg before "$before" --arg after "$after" --argjson pr "$PR" \
                   '{event_type: "editorial-merged", client_payload: {before: $before, after: $after, pr: $pr}}')
