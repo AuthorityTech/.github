@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import json
 import os
@@ -17,7 +18,7 @@ REPO = 'Bramwell-Inc/jaxonparrott.com'
 NAMES = ['agentic-verify', 'claims', 'portfolio-retired-pointers']
 
 MOCK = '''#!/usr/bin/env python3
-import json, os, pathlib, sys
+import json, os, pathlib, sys, time
 root = pathlib.Path(os.environ['FIXTURE'])
 f = json.loads((root / 'fixture.json').read_text())
 a = sys.argv[1:]
@@ -43,9 +44,31 @@ if '-X' in a and a[a.index('-X')+1] == 'PUT':
     if f.get('refuse_merge'):
         f['pr']['head']['sha'] = 'c'*40
         (root / 'fixture.json').write_text(json.dumps(f))
+        sys.stderr.write('gh: Head branch was modified. Review and try the merge again. (HTTP 409)\\n')
+        sys.exit(1)
+    if f.get('merged_elsewhere'):
+        f['pr']['merged'] = True
+        (root / 'fixture.json').write_text(json.dumps(f))
+        sys.stderr.write('gh: Pull Request is not mergeable (HTTP 405)\\n')
         sys.exit(1)
     assert '-f' in a and 'sha=' + 'a'*40 in a
+    # TOGETHER evaluations merge the same head at once, and GitHub tells each that its merge
+    # succeeded, with the same commit (jaxonparrott.com #202): none is answered until all have asked.
+    with (root / 'merges').open('a') as m: m.write('.')
+    deadline = time.time() + 5
+    while (root / 'merges').stat().st_size < int(os.environ.get('TOGETHER', '1')) and time.time() < deadline: time.sleep(0.01)
     output({'sha': 'd'*40}); sys.exit(0)
+if url.endswith('/git/refs'):
+    assert a[a.index('-X')+1] == 'POST' and 'ref=refs/editorial-merged/' + 'd'*40 in a and 'sha=' + 'd'*40 in a, a
+    # GitHub creates a ref once and refuses every later create of it; claimed: it already exists.
+    exists = f.get('claimed', False)
+    if not exists:
+        try: os.close(os.open(root / 'claimed', os.O_WRONLY | os.O_CREAT | os.O_EXCL))
+        except FileExistsError: exists = True
+    if exists:
+        output({'message': 'Reference already exists', 'status': '422'})
+        sys.stderr.write('gh: Reference already exists (HTTP 422)\\n'); sys.exit(1)
+    output({'ref': 'refs/editorial-merged/' + 'd'*40, 'object': {'sha': 'd'*40, 'type': 'commit'}}); sys.exit(0)
 if url.endswith('/dispatches'): sys.exit(0)
 if '/rules/branches/' in url:
     expr = a[a.index('--jq') + 1] if '--jq' in a else ''
@@ -79,7 +102,7 @@ elif '/issues/' in url and '/comments' in url:
     else:
         output(f.get('comments') or [])
 elif '/pulls/' in url:
-    count_file = root / 'reads'
+    count_file = pathlib.Path(os.environ.get('RUNNER_TEMP', root)) / 'reads'  # this evaluation's own reads
     count = int(count_file.read_text()) if count_file.exists() else 0
     count_file.write_text(str(count+1))
     p = f['pr'] if count < 2 else f.get('after', f['pr'])
@@ -90,7 +113,7 @@ elif '/actions/runs?' in url:
     output([99])
 elif '/check-runs?' in url:
     assert '/commits/' + 'a'*40 + '/' in url
-    read_file = root / 'check_reads'
+    read_file = pathlib.Path(os.environ.get('RUNNER_TEMP', root)) / 'check_reads'
     count = int(read_file.read_text()) if read_file.exists() else 0
     read_file.write_text(str(count+1))
     runs = f.get('later_runs', f['runs']) if count else f['runs']
@@ -113,18 +136,22 @@ def fixture():
     )
 
 class PublicationGate(unittest.TestCase):
-    def run_gate(self, f=None, repo=REPO, enabled='true', kind='editorial', required=None, trigger=''):
+    def run_gate(self, f=None, repo=REPO, enabled='true', kind='editorial', required=None, trigger='', together=1):
+        """together > 1 runs that many evaluations of the same head at once and returns all their results."""
         f = f or fixture()
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / 'fixture.json').write_text(json.dumps(f))
             for name, script in [('gh', MOCK), ('sleep', '#!/bin/sh\nexit 0\n')]:
                 p = root / name; p.write_text(script); p.chmod(0o755)
-            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, RUNNER_TEMP=d, GH_TOKEN='local-fixture-only', REPO=repo, PR='1', SHA=HEAD, KIND=kind, REQUIRED='\n'.join(['Vercel', *NAMES] if required is None else required), CONTENT_WITHOUT_PREVIEW=enabled, WORKFLOW_REF=repo + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE=trigger, BASE_REF='main')
-            result = subprocess.run(['bash', '-c', SCRIPT], env=env, text=True, capture_output=True, timeout=10)
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, GH_TOKEN='local-fixture-only', REPO=repo, PR='1', SHA=HEAD, KIND=kind, REQUIRED='\n'.join(['Vercel', *NAMES] if required is None else required), CONTENT_WITHOUT_PREVIEW=enabled, WORKFLOW_REF=repo + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE=trigger, BASE_REF='main', TOGETHER=str(together))
+            def evaluate(i):
+                temp = root / f'runner-{i}'; temp.mkdir()  # each job has its own RUNNER_TEMP
+                return subprocess.run(['bash', '-c', SCRIPT], env=dict(env, RUNNER_TEMP=str(temp)), text=True, capture_output=True, timeout=10)
+            with ThreadPoolExecutor(together) as pool: results = list(pool.map(evaluate, range(together)))
             calls = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()] if (root / 'calls.jsonl').exists() else []
             merged = any(('-X' in c and 'PUT' in c) or c[:2] == ['pr', 'merge'] for c in calls)
-            return result, merged, calls
+            return (results[0] if together == 1 else results), merged, calls
 
     def run_rounds(self, f=None, rounds=2, repo=REPO, enabled='true', kind='editorial', required=None, trigger=''):
         f = f or fixture()
@@ -230,7 +257,46 @@ class PublicationGate(unittest.TestCase):
         r, attempted, calls = self.run_gate(f)
         self.assertTrue(attempted)
         self.assertIn('moved', r.stdout)
-        self.assertFalse(any('/dispatches' in str(c) for c in calls))
+        self.assertFalse(any('/dispatches' in str(c) or '/git/refs' in str(c) for c in calls))
+
+    # 2026-11-06: two evaluations of jaxonparrott.com #202's green head merged it at once. GitHub told
+    # both their merge succeeded, with the same commit, and both sent editorial-merged, so two Search
+    # Indexing runs submitted the same pages. Only the evaluation that creates the claim ref sends.
+    def test_concurrent_evaluations_both_told_merged_send_one_dispatch(self):
+        results, merged, calls = self.run_gate(together=2)
+        for r in results: self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sum('-X' in c and 'PUT' in c for c in calls), 2, 'both merges succeeded')
+        self.assertEqual(sum('/dispatches' in str(c) for c in calls), 1)
+        self.assertEqual(sorted('a concurrent evaluation claimed' in r.stdout for r in results), [False, True])
+
+    def test_a_claim_that_cannot_be_settled_still_sends_one_dispatch_with_a_warning(self):
+        server = 'Server Error (HTTP 502)'
+        denied = 'Resource not accessible by integration (HTTP 403)'
+        # (claim failures before an answer, its message, ref already there, dispatches, warned)
+        for fails, message, claimed, sent, warned in [(0, server, False, 1, False), (1, server, False, 1, False), (99, server, False, 1, True),
+                                                       (99, denied, False, 1, True), (1, server, True, 1, True), (0, server, True, 0, False)]:
+            f = fixture(); f['claimed'] = claimed; f['fail'] = {'/git/refs': dict(times=fails, message=message, write=True)}
+            with self.subTest(fails=fails, message=message, claimed=claimed):
+                r, merged, calls = self.run_gate(f)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertTrue(merged)
+                self.assertEqual(sum('/dispatches' in str(c) for c in calls), sent, r.stdout)
+                self.assertEqual('could not be claimed' in r.stdout, warned, r.stdout)
+                self.assertLessEqual(sum('/git/refs' in str(c) for c in calls), 3)
+
+    def test_a_merge_refused_because_another_evaluation_merged_sends_nothing(self):
+        f = fixture(); f['merged_elsewhere'] = True
+        r, attempted, calls = self.run_gate(f)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('merged by a concurrent evaluation', r.stdout)
+        self.assertFalse(any('/dispatches' in str(c) or '/git/refs' in str(c) for c in calls))
+
+    def test_a_dispatch_that_fails_after_the_claim_still_fails_the_evaluation(self):
+        f = fixture(); f['fail'] = {'/dispatches': dict(times=99)}
+        r, merged, calls = self.run_gate(f)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('editorial-merged was not sent', r.stdout)
+        self.assertEqual(sum('/dispatches' in str(c) for c in calls), 3)
 
     # 2026-11-05: jaxonparrott.com main is to require jp-overlap, a status the Gateway posts within ten
     # minutes. A Dependabot head is green sooner: the gate tried one merge, GitHub refused it, and no
@@ -277,7 +343,7 @@ class PublicationGate(unittest.TestCase):
             r, merged, calls = self.run_gate(app_fixture(), **args)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertTrue(merged)
-            self.assertFalse(any('/files?' in str(c) or '/dispatches' in str(c) for c in calls))
+            self.assertFalse(any('/files?' in str(c) or '/dispatches' in str(c) or '/git/refs' in str(c) for c in calls))
             for state in ['absent', 'pending', 'failure', 'error']:
                 f = app_fixture(); f['statuses'] = [] if state == 'absent' else [dict(context='Railway', state=state)]
                 self.assert_held(f, **args)
