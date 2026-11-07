@@ -23,6 +23,18 @@ name: Auto-merge Gate (Reusable)
 #   Listed, it holds every editorial PR outside its paths forever, and each
 #   evaluation of that PR exits successfully, so nothing shows it is stuck.
 #
+# Listing Vercel does not add page-check to that required list. page-check is
+# the job id of the workflow named Page check. An editorial merge that finds it
+# skipped, neutral, or absent records that on this run and still merges: a
+# workflow that never started, a ruleset that did not run it, or a skip must not
+# sit forever behind a green gate job. The record is this run's warning and
+# summary. Two evaluations of one head can overlap, so it is not a pull request
+# comment. A run that is still going waits, and the completion re-evaluates. A
+# finished failure stops the merge, as any failed check does. A success merges
+# with no warning, including the success that job uses when it could not read
+# the pages. Dependabot and a caller that does not list Vercel are unchanged. A
+# skipped indexnow or site-integrity run stays a pass.
+#
 # Jaxon can opt routine posts and retired-pages data out of requiring a preview
 # status. The API file list must be complete and stable at the judged head; all
 # three unconditional CI checks remain required. Every present status/check
@@ -114,7 +126,7 @@ on:
         type: boolean
         default: false
       editorial-required-checks:
-        description: Newline-separated check run names or commit status contexts that must be present and successful before an editorial PR merges. List only names every editorial PR produces, from workflows with no pull_request paths filter; a path-filtered check blocks whenever it runs without being listed.
+        description: Newline-separated check run names or commit status contexts that must be present and successful before an editorial PR merges. Skipped, neutral, pending and missing do not meet a listed name. List only names every editorial PR produces, from workflows with no pull_request paths filter; a path-filtered check blocks whenever it runs without being listed, and listing one holds every editorial PR outside its paths.
         required: false
         type: string
         default: ""
@@ -345,8 +357,13 @@ jobs:
               else "open" end'
           }
           required='[]'
+          vercel_contract=false
+          page_unjudged=false
           if [[ $KIND == editorial ]]; then
             required=$(printf '%s\n' "$REQUIRED" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | jq -Rsc 'split("\n") | map(select(length > 0))')
+            # The caller's list, before the routine path removes Vercel. Presence of
+            # that context is the signal; page-check is not added to required.
+            if jq -e 'index("Vercel") != null' >/dev/null <<<"$required"; then vercel_contract=true; fi
           fi
           content_only=false
           classify_publication() {
@@ -393,7 +410,11 @@ jobs:
             # API still reports unfinished: a read that lags the event.
             lagging=$(jq --arg suite "${TRIGGER_SUITE:-}" '[.check_runs[] | select($suite != "" and (.check_suite.id | tostring) == $suite and .conclusion == null)] | length' <<<"$runs")
             # A required name, this caller's or the base's rules', is met only when it is
-            # present and every status or check run carrying it succeeded.
+            # present and every status or check run carrying it succeeded. Skipped and
+            # neutral do not meet it. A run that is not listed may be skipped or neutral:
+            # a path filter does that, and it is a pass. page-check is not inferred into
+            # this list. When the caller listed Vercel and every page-check run is
+            # skipped, neutral, or absent, this run records that and does not wait.
             unmet=$(jq -nc --argjson req "$required" --argjson ruled "$ruled" --argjson s "$statuses" --argjson c "$checks" '
               [($req + $ruled | unique)[] as $n | ([$s[], $c[]] | map(select(.name == $n))) as $m
                 | select(($m | length) == 0 or any($m[]; .state != "success")) | $n]')
@@ -414,6 +435,19 @@ jobs:
             else
               verdict=pending
             fi
+            page_unjudged=false
+            if [[ $vercel_contract == true ]] && jq -e '[.[] | select(.name == "page-check")] | length == 0 or all(.[]; .state == "skipped" or .state == "neutral")' >/dev/null <<<"$checks"; then
+              page_unjudged=true
+            fi
+          }
+          # The advisory is this run's own warning and summary. Editorial evaluations
+          # overlap, so a pull request comment written after a lookup can be posted
+          # twice. There is no shared write here.
+          note_unjudged() {
+            [[ $page_unjudged == true ]] || return 0
+            local line="Page check did not judge ${SHA}. The page-check run was skipped, neutral, or not there. This is not a clean page judgment, and it is not a hold. A finished Page check that fails still stops a merge."
+            echo "::warning::$line"
+            if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"; fi
           }
 
           if [[ $KIND == editorial ]]; then
@@ -447,6 +481,7 @@ jobs:
               partial) echo "::notice::Not merging #$PR: more than 100 statuses or check runs on $SHA."; exit 0 ;;
               pending) echo "::notice::Not merging #$PR yet: $SHA is waiting on $waiting. The status or workflow run that completes it re-evaluates the PR."; exit 0 ;;
             esac
+            note_unjudged
             # GitHub refuses this merge unless the head is still $SHA (409). It also
             # refuses while another evaluation of the same green head is merging it,
             # or when the base moved under a merge a moment ago (405): the merge is
