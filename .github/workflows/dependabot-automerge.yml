@@ -25,14 +25,15 @@ name: Auto-merge Gate (Reusable)
 #
 # Listing Vercel does not add page-check to that required list. page-check is
 # the job id of the workflow named Page check. An editorial merge that finds it
-# skipped, neutral, or absent posts one note and still merges: a workflow that
-# never started, a ruleset that did not run it, or a skip must not sit forever
-# behind a green gate job. A run that is still going waits, and the completion
-# re-evaluates. A finished failure stops the merge, as any failed check does,
-# which is how blocking defects are respected. A success merges with no note,
-# including the success that job uses when it could not read the pages.
-# Dependabot and a caller that does not list Vercel are unchanged. A skipped
-# indexnow or site-integrity run stays a pass.
+# skipped, neutral, or absent records that on this run and still merges: a
+# workflow that never started, a ruleset that did not run it, or a skip must not
+# sit forever behind a green gate job. The record is this run's warning and
+# summary. Two evaluations of one head can overlap, so it is not a pull request
+# comment. A run that is still going waits, and the completion re-evaluates. A
+# finished failure stops the merge, as any failed check does. A success merges
+# with no warning, including the success that job uses when it could not read
+# the pages. Dependabot and a caller that does not list Vercel are unchanged. A
+# skipped indexnow or site-integrity run stays a pass.
 #
 # Jaxon can opt routine posts and retired-pages data out of requiring a preview
 # status. The API file list must be complete and stable at the judged head; all
@@ -413,7 +414,7 @@ jobs:
             # neutral do not meet it. A run that is not listed may be skipped or neutral:
             # a path filter does that, and it is a pass. page-check is not inferred into
             # this list. When the caller listed Vercel and every page-check run is
-            # skipped, neutral, or absent, the merge notes that and does not wait.
+            # skipped, neutral, or absent, this run records that and does not wait.
             unmet=$(jq -nc --argjson req "$required" --argjson ruled "$ruled" --argjson s "$statuses" --argjson c "$checks" '
               [($req + $ruled | unique)[] as $n | ([$s[], $c[]] | map(select(.name == $n))) as $m
                 | select(($m | length) == 0 or any($m[]; .state != "success")) | $n]')
@@ -439,33 +440,14 @@ jobs:
               page_unjudged=true
             fi
           }
-          # One note. A failed or unreadable lookup posts nothing, so a retry cannot
-          # add a second copy. An unchanged note is left alone. The words do not
-          # depend on the merge, which has not been attempted yet. A failure to
-          # write the note must not stop the merge.
+          # The advisory is this run's own warning and summary. Editorial evaluations
+          # overlap, so a pull request comment written after a lookup can be posted
+          # twice. There is no shared write here.
           note_unjudged() {
             [[ $page_unjudged == true ]] || return 0
-            local marker='<!-- automerge-page-check-unjudged -->' body looked count id prior
-            body="$marker"$'\n'"Auto-merge gate: Page check did not judge ${SHA}. The page-check run was skipped, neutral, or not there. This is not a clean page judgment, and it is not a hold. A finished Page check that fails still stops a merge."
-            echo "::warning::Page check did not judge $SHA (skipped, neutral, or absent). This is not a clean page judgment."
-            if ! looked=$(gh api --paginate "repos/$REPO/issues/$PR/comments?per_page=100"); then
-              echo "::warning::Page check had not judged ${SHA}, and the existing notes could not be read, so none was posted."
-              return 0
-            fi
-            if ! count=$(jq -r --arg marker "$marker" '[.[] | select((.body // "") | startswith($marker))] | length' <<<"$looked"); then
-              echo "::warning::Page check had not judged ${SHA}, and the existing notes could not be read, so none was posted."
-              return 0
-            fi
-            if [[ $count == 1 ]]; then
-              id=$(jq -r --arg marker "$marker" '[.[] | select((.body // "") | startswith($marker))][0].id' <<<"$looked")
-              prior=$(jq -r --arg marker "$marker" '[.[] | select((.body // "") | startswith($marker))][0].body' <<<"$looked")
-              [[ $prior == "$body" ]] && return 0
-              gh api -X PATCH "repos/$REPO/issues/comments/$id" -f body="$body" >/dev/null || echo "::warning::The page-check note was not updated."
-            elif [[ $count == 0 ]]; then
-              gh api "repos/$REPO/issues/$PR/comments" -f body="$body" >/dev/null || echo "::warning::The page-check note was not posted."
-            else
-              echo "::warning::Page check had not judged ${SHA}, and the existing notes could not be told apart, so none was posted."
-            fi
+            local line="Page check did not judge ${SHA}. The page-check run was skipped, neutral, or not there. This is not a clean page judgment, and it is not a hold. A finished Page check that fails still stops a merge."
+            echo "::warning::$line"
+            if [[ -n ${GITHUB_STEP_SUMMARY:-} ]]; then printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"; fi
           }
 
           if [[ $KIND == editorial ]]; then
