@@ -9,14 +9,25 @@ name: Auto-merge Gate (Reusable)
 # - Dependabot patch or minor updates, grouped or single, where nothing changed in
 #   package.json or package-lock.json crosses a major. Decided on the PR's own
 #   events (the metadata action reads the pull_request payload).
-# - Editorial publication PRs: head branch in this same repository named
-#   editorial/..., base the default branch, any author. The publisher opens them
-#   and returns; nothing waits for this gate. Every name in
+# - Every other PR from a branch in this same repository into the default
+#   branch, whatever the branch is named and whoever opened it, when the caller
+#   lists editorial-required-checks (a caller that lists none, such as the App,
+#   gets Dependabot only). The code still calls this kind "editorial" and keeps
+#   its input and event names, because callers on @main and the post-merge
+#   workflows read them. The branch name is not a hold: it was one until
+#   2026-11-10 (only editorial/... merged), and agents renamed branches to get
+#   past it (jaxonparrott.com #220 writer/ closed, #221 editorial/ merged), so it
+#   guarded nothing (Jaxon, 2026-11-10: "Drop the hold"). What guards a merge is
+#   the checks. A draft PR is not merged, and two kinds are left to their own
+#   merger: Dependabot (judged as above, so a major is never merged as this
+#   kind) and land/..., which the Gateway producer (jarvis site-landing.mjs)
+#   rebase-merges itself at its Vercel-green head. Opener and publisher return;
+#   nothing waits for this gate. Every name in
 #   editorial-required-checks (a check run or a commit status context) must be
 #   present and successful; a missing one is pending, never a pass. So list only
-#   names that every editorial PR produces: the Vercel status, and checks whose
+#   names that every such PR produces: the Vercel status, and checks whose
 #   workflows run on every pull request, with no paths filter. "Every path the
-#   publisher writes" is not enough, because hand-made editorial/ PRs change code
+#   publisher writes" is not enough, because hand-made PRs change code
 #   too: portfolio-retired-pointers was filtered to content/** and portfolio/**,
 #   and held a src-only PR (jaxonparrott.com #110) until it was merged by hand. A
 #   path-filtered check needs no listing to block: every present check must pass.
@@ -50,7 +61,7 @@ name: Auto-merge Gate (Reusable)
 # waiting: each one reads the PR and its head commit once, merges if everything
 # is green, and otherwise exits successfully. Besides the PR's own events, every
 # successful commit status and every completed run of the site's PR workflows on
-# an editorial/ branch starts a new evaluation of the open eligible PRs whose
+# a branch other than the default starts a new evaluation of the open eligible PRs whose
 # head is that commit, so the event that completes the last check is the one that
 # merges. A read that still shows the completing run's own checks unfinished is
 # retried for up to a minute, since no later event may come. For the same reason
@@ -138,7 +149,7 @@ on:
         type: boolean
         default: false
       editorial-required-checks:
-        description: Newline-separated check run names or commit status contexts that must be present and successful before an editorial PR merges. Skipped, neutral, pending and missing do not meet a listed name. List only names every editorial PR produces, from workflows with no pull_request paths filter; a path-filtered check blocks whenever it runs without being listed, and listing one holds every editorial PR outside its paths.
+        description: Newline-separated check run names or commit status contexts that must be present and successful before a non-Dependabot PR merges. Listing any opts every PR from a branch in this repository into the default branch (not a draft, not land/) into this gate, whatever its branch name; listing none leaves this gate to Dependabot. Skipped, neutral, pending and missing do not meet a listed name. List only names every editorial PR produces, from workflows with no pull_request paths filter; a path-filtered check blocks whenever it runs without being listed, and listing one holds every editorial PR outside its paths.
         required: false
         type: string
         default: ""
@@ -160,13 +171,16 @@ jobs:
       (github.event_name == 'pull_request_target' &&
        github.event.pull_request.draft == false &&
        (github.event.pull_request.user.login == 'dependabot[bot]' ||
-        (startsWith(github.event.pull_request.head.ref, 'editorial/') &&
+        (inputs.editorial-required-checks != '' &&
+         !startsWith(github.event.pull_request.head.ref, 'land/') &&
          github.event.pull_request.head.repo.full_name == github.repository &&
          github.event.pull_request.base.ref == github.event.repository.default_branch))) ||
       (github.event_name == 'status' && github.event.state == 'success' &&
-       contains(format(',{0}', join(github.event.branches.*.name, ',')), ',editorial/')) ||
-      (github.event_name == 'workflow_run' &&
-       startsWith(github.event.workflow_run.head_branch, 'editorial/') &&
+       inputs.editorial-required-checks != '' &&
+       format(',{0},', join(github.event.branches.*.name, ',')) != format(',{0},', github.event.repository.default_branch)) ||
+      (github.event_name == 'workflow_run' && inputs.editorial-required-checks != '' &&
+       github.event.workflow_run.head_branch != github.event.repository.default_branch &&
+       !startsWith(github.event.workflow_run.head_branch, 'land/') &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -211,13 +225,15 @@ jobs:
             [[ $PR_AUTHOR == 'dependabot[bot]' ]] && kind=dependabot
             prs=$(jq -nc --argjson n "$PR" --arg sha "$PR_SHA" --arg kind "$kind" '[{number: $n, sha: $sha, kind: $kind}]')
           else
-            # Only editorial PRs recover from these events: the Dependabot metadata
-            # action needs the pull_request payload.
+            # Only non-Dependabot PRs recover from these events: the Dependabot
+            # metadata action needs the pull_request payload, so a Dependabot head
+            # is never taken here, where its major check would not run.
             base=$(gh api "repos/$REPO" --jq .default_branch)
             prs=$(gh api "repos/$REPO/commits/$SHA/pulls" | jq -c --arg repo "$REPO" --arg sha "$SHA" --arg base "$base" '
               [.[] | select(.state == "open" and .draft == false and .head.sha == $sha
                             and .head.repo.full_name == $repo and .base.ref == $base
-                            and (.head.ref | startswith("editorial/")))
+                            and .user.login != "dependabot[bot]"
+                            and (.head.ref | startswith("land/") | not))
                    | {number, sha: .head.sha, kind: "editorial"}]')
           fi
           echo "$EVENT on ${SHA:-$PR_SHA}: $prs"
@@ -365,7 +381,7 @@ jobs:
               elif .head.sha != $sha then "moved"
               elif .draft then "draft"
               elif $kind == "editorial" and (.head.repo.full_name != $repo or .base.ref != $base
-                     or (.head.ref | startswith("editorial/") | not)) then "ineligible"
+                     or .user.login == "dependabot[bot]" or (.head.ref | startswith("land/"))) then "ineligible"
               else "open" end'
           }
           required='[]'

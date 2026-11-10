@@ -217,13 +217,46 @@ class PublicationGate(unittest.TestCase):
         f = fixture(); f['file_api_error'] = True; variants.append(f)
         for f in variants: self.assert_held(f)
 
-    def test_moved_closed_draft_fork_wrong_base_wrong_branch_queue_hold(self):
-        for field, value in [('draft', True), ('state', 'closed'), ('head.sha', 'c'*40), ('head.ref', 'fix/platform'), ('base.ref', 'other'), ('head.repo.full_name', 'fork/site')]:
+    def test_moved_closed_draft_fork_wrong_base_own_merger_queue_hold(self):
+        for field, value in [('draft', True), ('state', 'closed'), ('head.sha', 'c'*40), ('head.ref', 'land/hub-evidence/r1'), ('base.ref', 'other'), ('head.repo.full_name', 'fork/site'), ('user', dict(login='dependabot[bot]'))]:
             f = fixture(); obj = f['pr']; parts = field.split('.')
             for part in parts[:-1]: obj = obj[part]
             obj[parts[-1]] = value
             self.assert_held(f)
         f = fixture(); f['rules'] = [dict(type='merge_queue')]; self.assert_held(f)
+
+    # The branch name is not a hold (Jaxon, 2026-11-10): any agent branch in the
+    # repository merges on the same checks an editorial/ branch does.
+    def test_any_branch_name_merges_on_the_same_checks(self):
+        for ref in ['writer/brief-2026-11-09', 'claude/fix-nav', 'editor/retire-page', 'fix/platform']:
+            with self.subTest(ref=ref):
+                f = fixture(); f['pr']['head']['ref'] = ref
+                result, merged, calls = self.run_gate(f)
+                self.assertTrue(merged, result.stdout + result.stderr)
+                self.assertEqual(sum('/dispatches' in str(c) for c in calls), 1)
+                f = fixture(); f['pr']['head']['ref'] = ref; f['runs'][0]['conclusion'] = 'failure'
+                self.assert_held(f)
+
+    def test_recovery_events_find_any_branch_but_never_dependabot_or_land(self):
+        def pull(n, ref, login='writer-seat'):
+            return dict(number=n, state='open', draft=False, user=dict(login=login), head=dict(sha=HEAD, ref=ref, repo=dict(full_name=REPO)), base=dict(ref='main'))
+        f = fixture(); f['commit_pulls'] = [pull(1, 'writer/brief'), pull(2, 'dependabot/npm/next-15.1', 'dependabot[bot]'), pull(3, 'land/hub-evidence/r1'), pull(4, 'editorial/post'), dict(pull(5, 'claude/draft'), draft=True)]
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'fixture.json').write_text(json.dumps(f))
+            for name, script in [('gh', MOCK), ('sleep', '#!/bin/sh\nexit 0\n')]:
+                p = root / name; p.write_text(script); p.chmod(0o755)
+            out = root / 'output'
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, GH_TOKEN='local-fixture-only', REPO=REPO, EVENT='status', PR='', PR_SHA='', PR_AUTHOR='', SHA=HEAD, GITHUB_OUTPUT=str(out))
+            r = subprocess.run(['bash', '-c', RESOLVE], env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(json.loads(out.read_text().split('prs=', 1)[1]), [dict(number=1, sha=HEAD, kind='editorial'), dict(number=4, sha=HEAD, kind='editorial')])
+
+    def test_the_job_filter_takes_any_branch_only_for_a_caller_that_lists_its_checks(self):
+        cond = SOURCE.split('  resolve:\n', 1)[1].split('    runs-on:', 1)[0]
+        self.assertNotIn("'editorial/'", cond)
+        self.assertEqual(cond.count("inputs.editorial-required-checks != ''"), 3)
+        self.assertEqual(cond.count("startsWith(github.event.pull_request.head.ref, 'land/')") + cond.count("startsWith(github.event.workflow_run.head_branch, 'land/')"), 2)
 
     def test_other_callers_and_default_input_retain_status_dependency(self):
         self.assert_held(fixture(), enabled='false')
