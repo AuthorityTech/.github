@@ -373,7 +373,12 @@ jobs:
           # gate merges nothing (see the top of this file).
           queue=$(gh api --paginate "repos/$REPO/rules/branches/${BASE_REF:-$base}" --jq '.[] | select(.type == "merge_queue") | .type')
           # Where the PR stands now: merged, closed, moved (head is no longer $SHA),
-          # draft, ineligible, or open.
+          # draft, ineligible, conflicting, or open. A conflicting PR (GitHub computed
+          # it mergeable false, state dirty, against the current base) is its author's
+          # to rebase or close, as a failed check is; the push that resolves it starts
+          # a new evaluation. Merging it only earns a 405 and a red gate run on the
+          # default branch (christianlehman.com #132, 2026-11-11: a duplicate of #131,
+          # which merged a minute earlier).
           pr_state() {
             gh api "repos/$REPO/pulls/$PR" | jq -r --arg sha "$SHA" --arg repo "$REPO" --arg base "$base" --arg kind "$KIND" '
               if .merged then "merged"
@@ -382,6 +387,7 @@ jobs:
               elif .draft then "draft"
               elif $kind == "editorial" and (.head.repo.full_name != $repo or .base.ref != $base
                      or .user.login == "dependabot[bot]" or (.head.ref | startswith("land/"))) then "ineligible"
+              elif .mergeable == false and .mergeable_state == "dirty" then "conflicting"
               else "open" end'
           }
           required='[]'
@@ -619,6 +625,9 @@ jobs:
                   exit 0 ;;
                 moved)
                   echo "::notice::Not merging #$PR: its head moved off $SHA."
+                  exit 0 ;;
+                conflicting)
+                  echo "::notice::Not merging #$PR: it conflicts with its base; Dependabot rebases it."
                   exit 0 ;;
                 *)
                   echo "::error::Merging #$PR at $SHA failed; the PR is $state."
