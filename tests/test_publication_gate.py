@@ -466,6 +466,47 @@ class PublicationGate(unittest.TestCase):
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
                 self.assertEqual(json.loads(out.read_text().split('prs=', 1)[1]), [dict(number=1, sha=HEAD, kind='editorial')])
 
+    def resolve(self, f, event='workflow_run', trigger='', author=''):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'fixture.json').write_text(json.dumps(f))
+            for name, script in [('gh', MOCK), ('sleep', '#!/bin/sh\nexit 0\n')]:
+                p = root / name; p.write_text(script); p.chmod(0o755)
+            out = root / 'output'
+            pr = event == 'pull_request_target'
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, GH_TOKEN='local-fixture-only', REPO=REPO, EVENT=event, PR='1' if pr else '', PR_SHA=HEAD if pr else '', PR_AUTHOR=author, SHA='' if pr else HEAD, GITHUB_OUTPUT=str(out), WORKFLOW_REF=REPO + '/.github/workflows/dependabot-automerge.yml@main', TRIGGER_SUITE=trigger)
+            r = subprocess.run(['bash', '-c', RESOLVE], env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            return json.loads(out.read_text().split('prs=', 1)[1])
+
+    # A head with another check or status still running cannot merge on this event,
+    # and that check's completion evaluates it again: no merge job is started for it.
+    def test_a_head_still_running_starts_no_merge_job(self):
+        pull = dict(number=1, state='open', draft=False, user=dict(login='writer-seat'), head=dict(sha=HEAD, ref='editorial/post', repo=dict(full_name=REPO)), base=dict(ref='main'))
+        one = [dict(number=1, sha=HEAD, kind='editorial')]
+        def f(runs=(), statuses=()):
+            x = fixture(); x['commit_pulls'] = [pull]
+            x['runs'] += [dict(name=n, conclusion=None, check_suite=dict(id=s)) for n, s in runs]
+            x['statuses'] = [dict(context=c, state=s) for c, s in statuses]
+            return x
+        for event in ['workflow_run', 'status']:
+            with self.subTest(event=event):
+                self.assertEqual(self.resolve(f(), event), one)
+                self.assertEqual(self.resolve(f(runs=[('site-integrity / schema', 2)]), event), [])
+                self.assertEqual(self.resolve(f(statuses=[('Vercel', 'pending')]), event), [])
+                # This gate's own runs (suite 99 in the mock) and the trigger's lagging read do not count.
+                self.assertEqual(self.resolve(f(runs=[('automerge / resolve', 99), ('claims', 5)]), event, trigger='5'), one)
+                # Finished results stay the merge step's to judge.
+                self.assertEqual(self.resolve(f(statuses=[('Vercel', 'failure')]), event), one)
+                # A failed or partial read keeps the PR.
+                broken = f(runs=[('site-integrity / schema', 2)]); broken['fail'] = {'/check-runs?': dict(times=9, message='Not Found (HTTP 404)')}
+                self.assertEqual(self.resolve(broken, event), one)
+                partial = f(runs=[('site-integrity / schema', 2)]); partial['check_count'] = 101
+                self.assertEqual(self.resolve(partial, event), one)
+        self.assertEqual(self.resolve(f(runs=[('site-integrity / schema', 2)]), 'pull_request_target', author='writer-seat'), [])
+        # A Dependabot PR's merge job waits for its checks and keeps its label; it always starts.
+        self.assertEqual(self.resolve(f(runs=[('site-integrity / schema', 2)]), 'pull_request_target', author='dependabot[bot]'), [dict(number=1, sha=HEAD, kind='dependabot')])
+
     # Listing Vercel does not make a missing or skipped page-check a hold. It notes
     # that the run did not judge, and merges. A finished failure still stops the merge.
     # A caller that does not list Vercel, and Dependabot, get neither note nor hold.

@@ -197,6 +197,8 @@ jobs:
           PR_SHA: ${{ github.event.pull_request.head.sha }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           SHA: ${{ github.event.sha || github.event.workflow_run.head_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          TRIGGER_SUITE: ${{ github.event.workflow_run.check_suite_id }}
         run: |
           set -euo pipefail
           # A read GitHub answers with a server error or a dropped connection is
@@ -235,6 +237,33 @@ jobs:
                             and .user.login != "dependabot[bot]"
                             and (.head.ref | startswith("land/") | not))
                    | {number, sha: .head.sha, kind: "editorial"}]')
+          fi
+          # An editorial head with a check run or status still running cannot merge on
+          # this evaluation: the merge step would read it pending and stop, and that
+          # check's own completion starts the next evaluation. Drop it here, so no merge
+          # job is billed for it (machinerelations.ai: ~600 evaluations a day, most of
+          # them pending). This gate's own runs and the run that started this evaluation
+          # (its read can lag the event) are not counted. A failed or partial read keeps
+          # the PR, and the merge step judges it as before.
+          still_running() {
+            local caller own runs status
+            caller="${WORKFLOW_REF:-}"; caller="${caller#"$REPO/"}"
+            caller="${caller%%@*}"
+            own=$(gh api "repos/$REPO/actions/runs?head_sha=$1&per_page=100" \
+              --jq "[.workflow_runs[] | select(.path == \"$caller\") | .check_suite_id]") || return 1
+            runs=$(gh api "repos/$REPO/commits/$1/check-runs?per_page=100") || return 1
+            status=$(gh api "repos/$REPO/commits/$1/status?per_page=100") || return 1
+            jq -en --argjson own "$own" --arg trigger "${TRIGGER_SUITE:-}" --argjson runs "$runs" --argjson status "$status" '
+              $runs.total_count <= 100 and $status.total_count <= 100 and
+              (any($runs.check_runs[]; .conclusion == null
+                    and (.check_suite.id as $s | $own | index($s) | not)
+                    and (.check_suite.id | tostring) != $trigger)
+               or any($status.statuses[]; .state == "pending"))' >/dev/null
+          }
+          if [[ $prs != '[]' ]] && jq -e 'all(.[]; .kind == "editorial")' <<<"$prs" >/dev/null &&
+             still_running "$(jq -r '.[0].sha' <<<"$prs")"; then
+            echo "$EVENT on ${SHA:-$PR_SHA}: a check or status is still running; its completion re-evaluates $prs."
+            prs='[]'
           fi
           echo "$EVENT on ${SHA:-$PR_SHA}: $prs"
           echo "prs=$prs" >> "$GITHUB_OUTPUT"
