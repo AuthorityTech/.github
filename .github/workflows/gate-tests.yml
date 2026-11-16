@@ -8,6 +8,8 @@ on:
       - tests/test_publication_gate.py
       - .github/actions/land-checked/**
       - tests/test_land_checked.py
+      - .github/actions/site-integrity/**
+      - tests/test_site_integrity.py
 
 permissions:
   contents: read
