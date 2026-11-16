@@ -187,17 +187,26 @@ class LandChecked(unittest.TestCase):
 
     def test_missing_skipped_failed_or_pending_required_check_holds(self):
         for state in [None, 'skipped', 'failure', 'neutral']:
-            r = self.land([['none']], required=['source'], checks=[{'name': 'source', 'conclusion': state}], minutes=0)
+            r = self.land([['none']], required=['source'], checks=[{'name': 'source', 'conclusion': state}], workflows='source.yml', minutes=0)
             self.assertNotEqual(r.code, 0, r.log)
             self.assertEqual(r.main, r.base)
 
     def test_optional_failure_blocks_successful_required_check(self):
-        r = self.land([['success']], checks=[{'name': 'other', 'conclusion': 'failure'}])
+        r = self.land([['success']], checks=[{'name': 'other', 'conclusion': 'failure'}], workflows='source.yml')
         self.assertNotEqual(r.code, 0, r.log)
         self.assertEqual(r.main, r.base)
 
     def test_new_dispatch_must_finish_even_if_same_sha_checks_already_pass(self):
         r = self.land([['success']], workflows='source.yml', dispatch_state='pending', minutes=0)
+        self.assertNotEqual(r.code, 0, r.log)
+        self.assertEqual(r.main, r.base)
+
+    def test_unmigrated_caller_keeps_vercel_contract_without_checks_permission(self):
+        r = self.land([['success']], extra_statuses=[{'context': 'advisory', 'state': 'failure'}])
+        self.assertEqual(r.code, 0, r.log)
+
+    def test_unmigrated_caller_cannot_skip_new_native_required_check(self):
+        r = self.land([['success']], required=['source'], minutes=0)
         self.assertNotEqual(r.code, 0, r.log)
         self.assertEqual(r.main, r.base)
 

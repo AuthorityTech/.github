@@ -25,7 +25,12 @@ for round in $(seq "$ROUNDS"); do
     # Existing sites without a native required context retain their build gate.
     [ "$ruled" != '[]' ] || ruled='["Vercel"]'
     status=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/status?per_page=100") || stop "reading statuses failed"
-    runs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100") || stop "reading check runs failed"
+    if [ -n "${CHECK_WORKFLOWS:-}" ]; then
+      runs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100") || stop "reading check runs failed"
+    else
+      runs='{"total_count":0,"check_runs":[]}'
+      status=$(jq --argjson ruled "$ruled" '.statuses |= map(select(.context == "Vercel" or (.context as $name | $ruled | index($name))))' <<< "$status")
+    fi
     (( $(jq '.total_count' <<< "$status") <= 100 && $(jq '.total_count' <<< "$runs") <= 100 )) || stop "partial check read"
     checks=$(jq -nc --argjson s "$status" --argjson c "$runs" '[$s.statuses[] | {name: .context, state}] + [$c.check_runs[] | {name, state: (.conclusion // "pending")}]')
     if jq -e 'any(.[]; .state == "failure" or .state == "error" or .state == "cancelled" or .state == "timed_out" or .state == "action_required" or .state == "startup_failure")' <<< "$checks" >/dev/null; then
