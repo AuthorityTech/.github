@@ -52,7 +52,7 @@ name: Auto-merge Gate (Reusable)
 # still blocks on failure or pending, including Vercel. No other caller changes.
 #
 # Both kinds fail closed: any failed status or check on the head stops the merge,
-# at least one commit status must exist (except that scoped routine path),
+# at least one explicit required check or commit status must exist,
 # all present statuses must be success, every other check
 # run must be success, skipped or neutral, and the merge names the head it judged,
 # so GitHub refuses it if the branch moved.
@@ -463,8 +463,6 @@ jobs:
             # merge GitHub refuses, and no later event evaluates it again. Read with the checks,
             # so a rule added while a Dependabot evaluation waits holds it too.
             ruled=$(gh api --paginate "repos/$REPO/rules/branches/${BASE_REF:-$base}" --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context' | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
-            # Commit statuses: Vercel reports the build here. At least one must
-            # exist outside the scoped routine path, which requires the CI build.
             status=$(gh api "repos/$REPO/commits/$SHA/status?per_page=100")
             statuses=$(jq -c '[.statuses[] | {name: .context, state}]' <<<"$status")
             # Check runs, excluding every run of this gate on the same head (this
@@ -486,9 +484,10 @@ jobs:
             unmet=$(jq -nc --argjson req "$required" --argjson ruled "$ruled" --argjson s "$statuses" --argjson c "$checks" '
               [($req + $ruled | unique)[] as $n | ([$s[], $c[]] | map(select(.name == $n))) as $m
                 | select(($m | length) == 0 or any($m[]; .state != "success")) | $n]')
+            required_count=$(jq -n --argjson req "$required" --argjson ruled "$ruled" '($req + $ruled | unique) | length')
             echo "statuses=$statuses checks=$checks required by the base's rules: $ruled unmet=$unmet"
-            waiting=$(jq -nc --argjson s "$statuses" --argjson c "$checks" --argjson u "$unmet" --arg content "$content_only" '
-              [(if ($s | length) == 0 and $content != "true" then "a commit status" else empty end), ($s[] | select(.state != "success") | .name),
+            waiting=$(jq -nc --argjson s "$statuses" --argjson c "$checks" --argjson u "$unmet" --argjson required "$required_count" '
+              [(if ($s | length) == 0 and $required == 0 then "a commit status" else empty end), ($s[] | select(.state != "success") | .name),
                ($c[] | select(.state != "success" and .state != "skipped" and .state != "neutral") | .name), $u[]] | unique')
             if jq -e 'any(.[]; .state == "failure" or .state == "error")' <<<"$statuses" >/dev/null ||
                jq -e 'any(.[]; .state == "failure" or .state == "cancelled" or .state == "timed_out" or .state == "action_required" or .state == "startup_failure")' <<<"$checks" >/dev/null; then
@@ -496,7 +495,7 @@ jobs:
             # A page beyond the first could hide a failure; never merge on a partial read.
             elif (( $(jq '.total_count' <<<"$status") > 100 || $(jq '.total_count' <<<"$runs") > 100 )); then
               verdict=partial
-            elif jq -e --arg content "$content_only" '(length > 0 or $content == "true") and all(.[]; .state == "success")' <<<"$statuses" >/dev/null &&
+            elif jq -e --argjson required "$required_count" '(length > 0 or $required > 0) and all(.[]; .state == "success")' <<<"$statuses" >/dev/null &&
                  jq -e 'all(.[]; .state == "success" or .state == "skipped" or .state == "neutral")' <<<"$checks" >/dev/null &&
                  jq -e 'length == 0' <<<"$unmet" >/dev/null; then
               verdict=green

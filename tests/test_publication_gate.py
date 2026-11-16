@@ -380,6 +380,29 @@ class PublicationGate(unittest.TestCase):
         checks = [c for c in calls if any('/check-runs?' in str(x) for x in c)]
         self.assertEqual(len(reads), len(checks), r.stdout)
 
+    def test_required_check_runs_admit_without_an_unrelated_commit_status(self):
+        repo = 'Bramwell-Inc/machinerelations.ai'
+        for kind in ['editorial', 'dependabot']:
+            f = fixture()
+            f['pr']['head']['repo']['full_name'] = repo
+            required = ['source-checks'] if kind == 'editorial' else []
+            if kind == 'dependabot':
+                f['rules'] = [dict(type='required_status_checks', parameters=dict(required_status_checks=[dict(context='source-checks')]))]
+            f['runs'] = [dict(name='source-checks', conclusion='success', check_suite=dict(id=1))]
+            with self.subTest(kind=kind):
+                result, merged, _ = self.run_gate(f, repo=repo, enabled='false', kind=kind, required=required)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(merged, result.stdout)
+                for state in ['missing', None, 'failure', 'cancelled', 'skipped', 'neutral']:
+                    blocked = copy.deepcopy(f)
+                    if state == 'missing': blocked['runs'] = []
+                    else: blocked['runs'][0]['conclusion'] = state
+                    self.assert_held(blocked, repo=repo, enabled='false', kind=kind, required=required)
+                for state in ['pending', 'failure', 'error']:
+                    blocked = copy.deepcopy(f)
+                    blocked['statuses'] = [dict(context='another-owner', state=state)]
+                    self.assert_held(blocked, repo=repo, enabled='false', kind=kind, required=required)
+
     def test_dependabot_still_needs_a_status(self):
         self.assert_held(fixture(), kind='dependabot')
 
