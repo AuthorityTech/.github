@@ -22,7 +22,7 @@ GH = r'''#!/usr/bin/env python3
 import json, os, pathlib, subprocess, sys
 root = pathlib.Path(os.environ['FIXTURE'])
 f = json.loads((root / 'fixture.json').read_text())
-a = sys.argv[1:]
+a = [x for x in sys.argv[1:] if x != '--paginate']
 if a[0] == 'workflow':
     f.setdefault('dispatches', []).append(a)
     (root / 'fixture.json').write_text(json.dumps(f))
