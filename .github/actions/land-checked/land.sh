@@ -13,9 +13,10 @@ stop() {
 for round in $(seq "$ROUNDS"); do
   sha=$(git rev-parse HEAD)
   git push --force origin "HEAD:refs/heads/$branch" || stop "pushing $branch failed"
-  started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  declare -A dispatched_after=()
   while IFS= read -r workflow_file; do
     [ -z "$workflow_file" ] && continue
+    dispatched_after["$workflow_file"]=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$sha&event=workflow_dispatch&per_page=100" --jq '.workflow_runs | map(.id) | max // 0') || stop "reading prior $workflow_file runs failed"
     gh workflow run "$workflow_file" --repo "$GITHUB_REPOSITORY" --ref "$branch" || stop "dispatching $workflow_file failed"
   done <<< "${CHECK_WORKFLOWS:-}"
   echo "Check $round of $ROUNDS: waiting up to $BUILD_MINUTES min on $sha ($branch)"
@@ -39,7 +40,7 @@ for round in $(seq "$ROUNDS"); do
     ready=true
     while IFS= read -r workflow_file; do
       [ -z "$workflow_file" ] && continue
-      dispatched=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$sha&event=workflow_dispatch&per_page=100" --jq '[.workflow_runs[] | select(.head_sha == "'"$sha"'" and .created_at >= "'"$started"'")] | sort_by(.id) | last | .conclusion // "pending"') || stop "reading dispatched $workflow_file failed"
+      dispatched=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$sha&event=workflow_dispatch&per_page=100" --jq '[.workflow_runs[] | select(.head_sha == "'"$sha"'" and .id > '"${dispatched_after[$workflow_file]}"')] | sort_by(.id) | last | .conclusion // "pending"') || stop "reading dispatched $workflow_file failed"
       case "$dispatched" in
         success) ;;
         pending) ready=false ;;

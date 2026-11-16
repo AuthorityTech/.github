@@ -31,7 +31,7 @@ if '/rules/branches/' in a[1]:
     print('\n'.join(f.get('required', ['Vercel'])))
     sys.exit(0)
 if '/actions/workflows/' in a[1]:
-    print(f.get('dispatch_state', 'success'))
+    print('0' if a[-1] == '.workflow_runs | map(.id) | max // 0' else f.get('dispatch_state', 'success'))
     sys.exit(0)
 if '/check-runs?' in a[1]:
     checks = f.get('checks', [])
