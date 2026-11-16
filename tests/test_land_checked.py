@@ -28,13 +28,13 @@ if a[0] == 'workflow':
     (root / 'fixture.json').write_text(json.dumps(f))
     sys.exit(0)
 if '/rules/branches/' in a[1]:
-    print('\n'.join(f.get('required', ['Vercel'])))
+    print('\n'.join(json.dumps({'context': r} if isinstance(r, str) else r) for r in f.get('required', ['Vercel'])))
     sys.exit(0)
 if '/actions/workflows/' in a[1]:
     sha = a[1].split('head_sha=')[1].split('&')[0]
     runs = [{'id': 10, 'head_sha': sha, 'conclusion': 'success'}]
-    if a[-1] != '.workflow_runs | map(.id) | max // 0' and f.get('dispatch_state') != 'pending':
-        runs.append({'id': 11, 'head_sha': sha, 'conclusion': f.get('dispatch_state', 'success')})
+    if a[-1] != '.workflow_runs | map(.id) | max // 0' and f.get('dispatch_state') != 'missing':
+        runs.append({'id': 11, 'head_sha': sha, 'conclusion': None if f.get('dispatch_state') == 'pending' else f.get('dispatch_state', 'success')})
     out = subprocess.run(['jq', '-r', a[-1]], input=json.dumps({'workflow_runs': runs}), capture_output=True, text=True, check=True)
     sys.stdout.write(out.stdout)
     sys.exit(0)
@@ -214,6 +214,25 @@ class LandChecked(unittest.TestCase):
         r = self.land([['success']], required=['source'], minutes=0)
         self.assertNotEqual(r.code, 0, r.log)
         self.assertEqual(r.main, r.base)
+
+    def test_required_app_binding_rejects_same_named_status_or_other_app(self):
+        for app in [None, {'id': 4}]:
+            r = self.land([['none']], required=[{'context': 'source', 'integration_id': 5}], checks=[{'name': 'source', 'conclusion': 'success', 'app': app}], extra_statuses=[{'context': 'source', 'state': 'success'}], workflows='source.yml', minutes=0)
+            self.assertNotEqual(r.code, 0, r.log)
+            self.assertEqual(r.main, r.base)
+        r = self.land([['none']], required=[{'context': 'source', 'integration_id': 5}], checks=[{'name': 'source', 'conclusion': 'success', 'app': {'id': 5}}], workflows='source.yml')
+        self.assertEqual(r.code, 0, r.log)
+
+    def test_legacy_vercel_still_required_when_another_native_context_passes(self):
+        r = self.land([['none']], required=['source'], extra_statuses=[{'context': 'source', 'state': 'success'}], minutes=0)
+        self.assertNotEqual(r.code, 0, r.log)
+        self.assertEqual(r.main, r.base)
+
+    def test_stale_dispatch_success_cannot_cover_missing_pending_or_failed_new_run(self):
+        for state in ['missing', 'pending', 'failure']:
+            r = self.land([['success']], workflows='source.yml', dispatch_state=state, minutes=0)
+            self.assertNotEqual(r.code, 0, r.log)
+            self.assertEqual(r.main, r.base)
 
     def test_dispatch_is_repeated_after_rebase(self):
         r = self.land([['success'], ['success']], workflows='source.yml', other='add')

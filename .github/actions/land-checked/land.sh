@@ -22,18 +22,20 @@ for round in $(seq "$ROUNDS"); do
   echo "Check $round of $ROUNDS: waiting up to $BUILD_MINUTES min on $sha ($branch)"
   deadline=$(( $(date +%s) + BUILD_MINUTES * 60 ))
   while :; do
-    ruled=$(gh api --paginate "repos/$GITHUB_REPOSITORY/rules/branches/main" --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context' | jq -Rsc 'split("\n") | map(select(length > 0)) | unique') || stop "reading main requirements failed"
+    ruled=$(gh api --paginate "repos/$GITHUB_REPOSITORY/rules/branches/main" --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]' | jq -sc 'unique_by(.context, .integration_id)') || stop "reading main requirements failed"
     # Existing sites without a native required context retain their build gate.
-    [ "$ruled" != '[]' ] || ruled='["Vercel"]'
+    if [ "$ruled" = '[]' ] || [ -z "${CHECK_WORKFLOWS:-}" ]; then
+      ruled=$(jq -c '. + [{context:"Vercel"}] | unique_by(.context, .integration_id)' <<< "$ruled")
+    fi
     status=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/status?per_page=100") || stop "reading statuses failed"
     if [ -n "${CHECK_WORKFLOWS:-}" ]; then
       runs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100") || stop "reading check runs failed"
     else
       runs='{"total_count":0,"check_runs":[]}'
-      status=$(jq --argjson ruled "$ruled" '.statuses |= map(select(.context == "Vercel" or (.context as $name | $ruled | index($name))))' <<< "$status")
+      status=$(jq --argjson ruled "$ruled" '.statuses |= map(select(.context == "Vercel" or (.context as $name | $ruled | any(.context == $name))))' <<< "$status")
     fi
     (( $(jq '.total_count' <<< "$status") <= 100 && $(jq '.total_count' <<< "$runs") <= 100 )) || stop "partial check read"
-    checks=$(jq -nc --argjson s "$status" --argjson c "$runs" '[$s.statuses[] | {name: .context, state}] + [$c.check_runs[] | {name, state: (.conclusion // "pending")}]')
+    checks=$(jq -nc --argjson s "$status" --argjson c "$runs" '[$s.statuses[] | {name: .context, state, app: null}] + [$c.check_runs[] | {name, state: (.conclusion // "pending"), app: .app.id}]')
     if jq -e 'any(.[]; .state == "failure" or .state == "error" or .state == "cancelled" or .state == "timed_out" or .state == "action_required" or .state == "startup_failure")' <<< "$checks" >/dev/null; then
       stop "a check failed for $sha: $checks"
     fi
@@ -49,7 +51,7 @@ for round in $(seq "$ROUNDS"); do
     done <<< "${CHECK_WORKFLOWS:-}"
     if [ "$ready" = true ] && jq -e --argjson required "$ruled" '
       . as $checks | all(.[]; .state == "success" or .state == "skipped" or .state == "neutral") and
-      all($required[]; . as $name | [$checks[] | select(.name == $name)] | length > 0 and all(.[]; .state == "success"))
+      all($required[]; . as $rule | [$checks[] | select(.name == $rule.context and (($rule.integration_id // 0) <= 0 or .app == $rule.integration_id))] | length > 0 and all(.[]; .state == "success"))
     ' <<< "$checks" >/dev/null; then break; fi
     [ "$(date +%s)" -lt "$deadline" ] || stop "checks still pending for $sha after $BUILD_MINUTES min"
     sleep 15
