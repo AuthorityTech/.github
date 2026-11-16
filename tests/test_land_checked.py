@@ -31,7 +31,12 @@ if '/rules/branches/' in a[1]:
     print('\n'.join(f.get('required', ['Vercel'])))
     sys.exit(0)
 if '/actions/workflows/' in a[1]:
-    print('0' if a[-1] == '.workflow_runs | map(.id) | max // 0' else f.get('dispatch_state', 'success'))
+    sha = a[1].split('head_sha=')[1].split('&')[0]
+    runs = [{'id': 10, 'head_sha': sha, 'conclusion': 'success'}]
+    if a[-1] != '.workflow_runs | map(.id) | max // 0' and f.get('dispatch_state') != 'pending':
+        runs.append({'id': 11, 'head_sha': sha, 'conclusion': f.get('dispatch_state', 'success')})
+    out = subprocess.run(['jq', '-r', a[-1]], input=json.dumps({'workflow_runs': runs}), capture_output=True, text=True, check=True)
+    sys.stdout.write(out.stdout)
     sys.exit(0)
 if '/check-runs?' in a[1]:
     checks = f.get('checks', [])
