@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Moves main to HEAD only once that exact commit's Vercel status is success: pushes it to a
-# land/ branch, waits for Vercel there, then fast-forwards main to it. When main moved
-# meanwhile, rebases and builds again. Never force-pushes main.
+# Verify the exact land/ commit before fast-forwarding main; rebase and recheck if main moves.
 set -euo pipefail
 
 workflow=$(basename "${GITHUB_WORKFLOW_REF%@*}")
@@ -15,20 +13,47 @@ stop() {
 for round in $(seq "$ROUNDS"); do
   sha=$(git rev-parse HEAD)
   git push --force origin "HEAD:refs/heads/$branch" || stop "pushing $branch failed"
-  echo "Build $round of $ROUNDS: waiting up to $BUILD_MINUTES min for Vercel on $sha ($branch)"
+  declare -A dispatched_after=()
+  while IFS= read -r workflow_file; do
+    [ -z "$workflow_file" ] && continue
+    dispatched_after["$workflow_file"]=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$sha&event=workflow_dispatch&per_page=100" --jq '.workflow_runs | map(.id) | max // 0') || stop "reading prior $workflow_file runs failed"
+    gh workflow run "$workflow_file" --repo "$GITHUB_REPOSITORY" --ref "$branch" || stop "dispatching $workflow_file failed"
+  done <<< "${CHECK_WORKFLOWS:-}"
+  echo "Check $round of $ROUNDS: waiting up to $BUILD_MINUTES min on $sha ($branch)"
   deadline=$(( $(date +%s) + BUILD_MINUTES * 60 ))
-  last=
   while :; do
-    # GitHub lists statuses newest first, so the first Vercel one is its current state.
-    state=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/statuses?per_page=100" \
-      --jq 'map(select(.context == "Vercel"))[0] | if . then "\(.state) \(.target_url)" else "none" end') || state=unreadable
-    [ "$state" = "$last" ] || echo "Vercel: $state"
-    last=$state
-    case $state in
-      success*) break ;;
-      failure* | error*) stop "Vercel reported $state for $sha" ;;
-    esac
-    [ "$(date +%s)" -lt "$deadline" ] || stop "Vercel still ${state%% *} for $sha after $BUILD_MINUTES min"
+    ruled=$(gh api --paginate "repos/$GITHUB_REPOSITORY/rules/branches/main" --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]' | jq -sc 'unique_by(.context, .integration_id)') || stop "reading main requirements failed"
+    # Existing sites without a native required context retain their build gate.
+    if [ "$ruled" = '[]' ] || [ -z "${CHECK_WORKFLOWS:-}" ]; then
+      ruled=$(jq -c '. + [{context:"Vercel"}] | unique_by(.context, .integration_id)' <<< "$ruled")
+    fi
+    status=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/status?per_page=100") || stop "reading statuses failed"
+    if [ -n "${CHECK_WORKFLOWS:-}" ]; then
+      runs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100") || stop "reading check runs failed"
+    else
+      runs='{"total_count":0,"check_runs":[]}'
+      status=$(jq --argjson ruled "$ruled" '.statuses |= map(select(.context == "Vercel" or (.context as $name | $ruled | any(.context == $name))))' <<< "$status")
+    fi
+    (( $(jq '.total_count' <<< "$status") <= 100 && $(jq '.total_count' <<< "$runs") <= 100 )) || stop "partial check read"
+    checks=$(jq -nc --argjson s "$status" --argjson c "$runs" '[$s.statuses[] | {name: .context, state, app: null}] + [$c.check_runs[] | {name, state: (.conclusion // "pending"), app: .app.id}]')
+    if jq -e 'any(.[]; .state == "failure" or .state == "error" or .state == "cancelled" or .state == "timed_out" or .state == "action_required" or .state == "startup_failure")' <<< "$checks" >/dev/null; then
+      stop "a check failed for $sha: $checks"
+    fi
+    ready=true
+    while IFS= read -r workflow_file; do
+      [ -z "$workflow_file" ] && continue
+      dispatched=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$sha&event=workflow_dispatch&per_page=100" --jq '[.workflow_runs[] | select(.head_sha == "'"$sha"'" and .id > '"${dispatched_after[$workflow_file]}"')] | sort_by(.id) | last | .conclusion // "pending"') || stop "reading dispatched $workflow_file failed"
+      case "$dispatched" in
+        success) ;;
+        pending) ready=false ;;
+        *) stop "$workflow_file concluded $dispatched for $sha" ;;
+      esac
+    done <<< "${CHECK_WORKFLOWS:-}"
+    if [ "$ready" = true ] && jq -e --argjson required "$ruled" '
+      . as $checks | all(.[]; .state == "success" or .state == "skipped" or .state == "neutral") and
+      all($required[]; . as $rule | [$checks[] | select(.name == $rule.context and (($rule.integration_id // 0) <= 0 or .app == $rule.integration_id))] | length > 0 and all(.[]; .state == "success"))
+    ' <<< "$checks" >/dev/null; then break; fi
+    [ "$(date +%s)" -lt "$deadline" ] || stop "checks still pending for $sha after $BUILD_MINUTES min"
     sleep 15
   done
   if git push origin HEAD:main; then
