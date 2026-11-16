@@ -439,8 +439,26 @@ class PublicationGate(unittest.TestCase):
         self.assertIn('HTTP 502', r.stderr)
         self.assertEqual(sum('/status?' in str(c) for c in calls), 4, 'four tries, then the error stands')
 
-    def test_client_errors_and_writes_are_never_retried_by_the_read_wrapper(self):
+    # 2026-11-16: GitHub answered a read of open, green machinerelations.ai #685 with a 404 three
+    # seconds after serving it, and that evaluation, the head's last event, ended unmerged.
+    def test_a_spurious_404_on_a_read_is_retried_and_the_head_still_merges(self):
+        baseline = self.run_gate()[2]
+        for key in ['/pulls/', '/status?', '/check-runs?']:
+            f = fixture(); f['fail'] = {key: dict(times=1, message='Not Found (HTTP 404)')}
+            with self.subTest(key=key):
+                r, merged, calls = self.run_gate(f)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertTrue(merged, r.stdout + r.stderr)
+                self.assertEqual(sum(key in str(c) for c in calls), sum(key in str(c) for c in baseline) + 1)
+                self.assertEqual(sum('/dispatches' in str(c) for c in calls), 1)
         f = fixture(); f['fail'] = {'/status?': dict(times=99, message='Not Found (HTTP 404)')}
+        r, merged, calls = self.run_gate(f)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(merged)
+        self.assertEqual(sum('/status?' in str(c) for c in calls), 4, 'four tries, then the 404 stands')
+
+    def test_client_errors_and_writes_are_never_retried_by_the_read_wrapper(self):
+        f = fixture(); f['fail'] = {'/status?': dict(times=99, message='Forbidden (HTTP 403)')}
         r, merged, calls = self.run_gate(f)
         self.assertNotEqual(r.returncode, 0)
         self.assertFalse(merged)
