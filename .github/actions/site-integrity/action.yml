@@ -35,7 +35,7 @@ runs:
       run: |
         set -euo pipefail
         printf '%s\n' "$SITE_INTEGRITY_INSTALL_COMMAND" > "$RUNNER_TEMP/site-integrity-install.sh"
-        bash "$RUNNER_TEMP/site-integrity-install.sh"
+        bash -euo pipefail "$RUNNER_TEMP/site-integrity-install.sh"
 
     - name: Validate internal links
       if: ${{ inputs.internal-links-config != '' }}
@@ -61,7 +61,7 @@ runs:
       run: |
         set -euo pipefail
         printf '%s\n' "$SITE_INTEGRITY_SCHEMA_COMMAND" > "$RUNNER_TEMP/site-integrity-schema.sh"
-        bash "$RUNNER_TEMP/site-integrity-schema.sh"
+        bash -euo pipefail "$RUNNER_TEMP/site-integrity-schema.sh"
 
     - name: Run extra commands
       if: ${{ inputs.extra-commands != '' }}
@@ -72,4 +72,4 @@ runs:
       run: |
         set -euo pipefail
         printf '%s\n' "$SITE_INTEGRITY_EXTRA_COMMANDS" > "$RUNNER_TEMP/site-integrity-extra.sh"
-        bash "$RUNNER_TEMP/site-integrity-extra.sh"
+        bash -euo pipefail "$RUNNER_TEMP/site-integrity-extra.sh"
