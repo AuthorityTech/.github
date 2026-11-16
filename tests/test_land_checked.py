@@ -23,7 +23,21 @@ import json, os, pathlib, subprocess, sys
 root = pathlib.Path(os.environ['FIXTURE'])
 f = json.loads((root / 'fixture.json').read_text())
 a = sys.argv[1:]
-assert a[0] == 'api' and a[1].startswith('repos/' + os.environ['GITHUB_REPOSITORY'] + '/commits/') and '/statuses?' in a[1], a
+if a[0] == 'workflow':
+    f.setdefault('dispatches', []).append(a)
+    (root / 'fixture.json').write_text(json.dumps(f))
+    sys.exit(0)
+if '/rules/branches/' in a[1]:
+    print('\n'.join(f.get('required', ['Vercel'])))
+    sys.exit(0)
+if '/actions/workflows/' in a[1]:
+    print(f.get('dispatch_state', 'success'))
+    sys.exit(0)
+if '/check-runs?' in a[1]:
+    checks = f.get('checks', [])
+    print(json.dumps({'total_count': len(checks), 'check_runs': checks}))
+    sys.exit(0)
+assert a[0] == 'api' and '/status?' in a[1], a
 sha = a[1].split('/commits/')[1].split('/')[0]
 def ref(name):
     out = subprocess.run(['git', '--git-dir', os.environ['ORIGIN'], 'rev-parse', '-q', '--verify', name], capture_output=True, text=True).stdout.strip()
@@ -38,8 +52,8 @@ if f['move_to'] and len(f['reads']) == 1:
 (root / 'fixture.json').write_text(json.dumps(f))
 states = f['builds'][min(build, len(f['builds']) - 1)][:n + 1]
 statuses = [{'context': 'Vercel', 'state': s, 'target_url': 'https://vercel.example/' + s} for s in reversed(states) if s != 'none']
-statuses.insert(1, {'context': 'jp-overlap', 'state': 'failure', 'target_url': None})
-out = json.dumps(statuses)
+statuses = list({s['context']: s for s in reversed(statuses)}.values()) + f.get('extra_statuses', [])
+out = json.dumps({'total_count': len(statuses), 'statuses': statuses})
 if '--jq' in a:
     out = subprocess.run(['jq', '-r', a[a.index('--jq') + 1]], input=out, capture_output=True, text=True, check=True).stdout
 sys.stdout.write(out)
@@ -51,7 +65,7 @@ class LandChecked(unittest.TestCase):
     def setUpClass(cls):
         assert shutil.which('jq'), 'the gh stub applies --jq with jq, as gh does'
 
-    def land(self, builds, other=None, rounds=6, minutes=15, after_rebase=''):
+    def land(self, builds, other=None, rounds=6, minutes=15, after_rebase='', required=None, checks=None, workflows='', dispatch_state='success', extra_statuses=None):
         """Lands one producer commit; builds lists Vercel's states per distinct commit, read by read.
         other ('add' or 'conflict') is another writer's commit, which becomes main at the first read."""
         d = Path(tempfile.mkdtemp())
@@ -86,14 +100,14 @@ class LandChecked(unittest.TestCase):
         for name, body in [('gh', GH), ('sleep', '#!/bin/sh\nexit 0\n')]:
             (stubs / name).write_text(body)
             (stubs / name).chmod(0o755)
-        (d / 'fixture.json').write_text(json.dumps(dict(builds=builds, move_to=move_to, seen=[], reads=[])))
+        (d / 'fixture.json').write_text(json.dumps(dict(builds=builds, move_to=move_to, seen=[], reads=[], required=required if required is not None else ['Vercel'], checks=checks or [], dispatch_state=dispatch_state, extra_statuses=extra_statuses or [])))
         output = d / 'output'
         output.write_text('')
         env.update(PATH=str(stubs) + os.pathsep + env['PATH'], FIXTURE=str(d), ORIGIN=str(origin), BRANCH=BRANCH,
                    GITHUB_REPOSITORY=REPO, GITHUB_RUN_ID='7', GITHUB_RUN_ATTEMPT='1',
                    GITHUB_WORKFLOW_REF=REPO + '/.github/workflows/producer.yml@refs/heads/main',
                    GITHUB_OUTPUT=str(output), GH_TOKEN='local-fixture-only',
-                   BUILD_MINUTES=str(minutes), ROUNDS=str(rounds), AFTER_REBASE=after_rebase)
+                   CHECK_WORKFLOWS=workflows, BUILD_MINUTES=str(minutes), ROUNDS=str(rounds), AFTER_REBASE=after_rebase)
         result = subprocess.run(['bash', str(SCRIPT)], cwd=work, env=env, capture_output=True, text=True, timeout=60)
         f = json.loads((d / 'fixture.json').read_text())
 
@@ -103,7 +117,7 @@ class LandChecked(unittest.TestCase):
 
         return SimpleNamespace(
             code=result.returncode, log=result.stdout + result.stderr, base=base, ours=ours, other=move_to,
-            main=at('refs/heads/main'), land=at('refs/heads/' + BRANCH), seen=f['seen'], reads=f['reads'],
+            main=at('refs/heads/main'), land=at('refs/heads/' + BRANCH), seen=f['seen'], reads=f['reads'], dispatches=f.get('dispatches', []),
             outputs=dict(line.split('=', 1) for line in output.read_text().splitlines()),
             git=lambda *args: git(work, *args), work=work)
 
@@ -121,7 +135,7 @@ class LandChecked(unittest.TestCase):
         r = self.land([['pending']], minutes=0)
         self.assertEqual(r.code, 1, r.log)
         self.assertEqual((r.main, r.land, r.outputs), (r.base, r.ours, {}))
-        self.assertIn('Vercel still pending for ' + r.ours + ' after 0 min', r.log)
+        self.assertIn('checks still pending for ' + r.ours + ' after 0 min', r.log)
 
     def test_failure_or_error_leaves_main_untouched(self):
         for state in ['failure', 'error']:
@@ -129,7 +143,7 @@ class LandChecked(unittest.TestCase):
                 r = self.land([['pending', state]])
                 self.assertEqual(r.code, 1, r.log)
                 self.assertEqual((r.main, r.land, r.outputs), (r.base, r.ours, {}))
-                self.assertIn('Vercel reported ' + state, r.log)
+                self.assertIn('a check failed for ', r.log)
 
     def test_main_moved_rebases_builds_again_and_lands(self):
         # after-rebase passes only on the rebased tree, which has the other writer's file.
@@ -164,6 +178,33 @@ class LandChecked(unittest.TestCase):
         self.assertEqual(r.code, 1, r.log)
         self.assertEqual((r.main, r.land, r.seen), (r.other, r.ours, [r.ours]))
         self.assertIn('after-rebase failed', r.log)
+
+    def test_native_check_run_without_status_lands(self):
+        r = self.land([['none']], required=['source'], checks=[{'name': 'source', 'conclusion': 'success'}], workflows='source.yml')
+        self.assertEqual(r.code, 0, r.log)
+        self.assertEqual(r.main, r.ours)
+        self.assertEqual(len(r.dispatches), 1)
+
+    def test_missing_skipped_failed_or_pending_required_check_holds(self):
+        for state in [None, 'skipped', 'failure', 'neutral']:
+            r = self.land([['none']], required=['source'], checks=[{'name': 'source', 'conclusion': state}], minutes=0)
+            self.assertNotEqual(r.code, 0, r.log)
+            self.assertEqual(r.main, r.base)
+
+    def test_optional_failure_blocks_successful_required_check(self):
+        r = self.land([['success']], checks=[{'name': 'other', 'conclusion': 'failure'}])
+        self.assertNotEqual(r.code, 0, r.log)
+        self.assertEqual(r.main, r.base)
+
+    def test_new_dispatch_must_finish_even_if_same_sha_checks_already_pass(self):
+        r = self.land([['success']], workflows='source.yml', dispatch_state='pending', minutes=0)
+        self.assertNotEqual(r.code, 0, r.log)
+        self.assertEqual(r.main, r.base)
+
+    def test_dispatch_is_repeated_after_rebase(self):
+        r = self.land([['success'], ['success']], workflows='source.yml', other='add')
+        self.assertEqual(r.code, 0, r.log)
+        self.assertEqual(len(r.dispatches), 2)
 
 
 if __name__ == '__main__':
