@@ -2,12 +2,12 @@ name: Land checked
 description: >-
   Verifies the exact land/ commit against main's native required checks and all present checks,
   then fast-forwards main. Rebase and recheck when main moves. Needs contents write,
-  statuses read; dispatching source workflows also needs checks read and actions write.
+  statuses read; dispatching source workflows also needs statuses write, checks read and actions write.
   With no dispatch input, existing callers retain their Vercel/status contract.
 
 inputs:
   check-workflows:
-    description: Newline-separated existing workflows to dispatch on each exact land commit. Configure an owner for every required source check; missing owners fail closed.
+    description: Newline-separated existing workflows to dispatch on each exact land commit. Each passed job named as a required context of main is reported as a commit status, since GitHub counts no dispatched check run toward a ruleset. Missing owners fail closed.
     default: ""
   build-minutes:
     description: Longest wait for checks on one commit.

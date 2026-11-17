@@ -23,6 +23,19 @@ import json, os, pathlib, subprocess, sys
 root = pathlib.Path(os.environ['FIXTURE'])
 f = json.loads((root / 'fixture.json').read_text())
 a = [x for x in sys.argv[1:] if x != '--paginate']
+if '-X' in a:
+    path = a[a.index('-X') + 2]
+    assert a[a.index('-X') + 1] == 'POST' and '/statuses/' in path, a
+    fields = dict(a[i + 1].split('=', 1) for i, x in enumerate(a) if x == '-f')
+    f.setdefault('posted', []).append([fields['context'], path.rsplit('/', 1)[1]])
+    f['extra_statuses'].append({'context': fields['context'], 'state': fields['state']})
+    (root / 'fixture.json').write_text(json.dumps(f))
+    sys.exit(0)
+if '/actions/runs/' in a[1] and a[1].split('?')[0].endswith('/jobs'):
+    jobs = [{'name': c['name'], 'conclusion': c.get('conclusion'), 'html_url': 'https://jobs.example/' + c['name']} for c in f.get('jobs', f.get('checks', []))]
+    out = subprocess.run(['jq', '-r', a[-1]], input=json.dumps({'jobs': jobs}), capture_output=True, text=True, check=True)
+    sys.stdout.write(out.stdout)
+    sys.exit(0)
 if a[0] == 'workflow':
     f.setdefault('dispatches', []).append(a)
     (root / 'fixture.json').write_text(json.dumps(f))
@@ -70,7 +83,7 @@ class LandChecked(unittest.TestCase):
     def setUpClass(cls):
         assert shutil.which('jq'), 'the gh stub applies --jq with jq, as gh does'
 
-    def land(self, builds, other=None, rounds=6, minutes=15, after_rebase='', required=None, checks=None, workflows='', dispatch_state='success', extra_statuses=None):
+    def land(self, builds, other=None, rounds=6, minutes=15, after_rebase='', required=None, checks=None, workflows='', dispatch_state='success', extra_statuses=None, jobs=None):
         """Lands one producer commit; builds lists Vercel's states per distinct commit, read by read.
         other ('add' or 'conflict') is another writer's commit, which becomes main at the first read."""
         d = Path(tempfile.mkdtemp())
@@ -105,7 +118,7 @@ class LandChecked(unittest.TestCase):
         for name, body in [('gh', GH), ('sleep', '#!/bin/sh\nexit 0\n')]:
             (stubs / name).write_text(body)
             (stubs / name).chmod(0o755)
-        (d / 'fixture.json').write_text(json.dumps(dict(builds=builds, move_to=move_to, seen=[], reads=[], required=required if required is not None else ['Vercel'], checks=checks or [], dispatch_state=dispatch_state, extra_statuses=extra_statuses or [])))
+        (d / 'fixture.json').write_text(json.dumps(dict(builds=builds, move_to=move_to, seen=[], reads=[], required=required if required is not None else ['Vercel'], checks=checks or [], dispatch_state=dispatch_state, extra_statuses=extra_statuses or [], **({'jobs': jobs} if jobs is not None else {}))))
         output = d / 'output'
         output.write_text('')
         env.update(PATH=str(stubs) + os.pathsep + env['PATH'], FIXTURE=str(d), ORIGIN=str(origin), BRANCH=BRANCH,
@@ -122,7 +135,7 @@ class LandChecked(unittest.TestCase):
 
         return SimpleNamespace(
             code=result.returncode, log=result.stdout + result.stderr, base=base, ours=ours, other=move_to,
-            main=at('refs/heads/main'), land=at('refs/heads/' + BRANCH), seen=f['seen'], reads=f['reads'], dispatches=f.get('dispatches', []),
+            main=at('refs/heads/main'), land=at('refs/heads/' + BRANCH), seen=f['seen'], reads=f['reads'], dispatches=f.get('dispatches', []), posted=f.get('posted', []),
             outputs=dict(line.split('=', 1) for line in output.read_text().splitlines()),
             git=lambda *args: git(work, *args), work=work)
 
@@ -184,11 +197,34 @@ class LandChecked(unittest.TestCase):
         self.assertEqual((r.main, r.land, r.seen), (r.other, r.ours, [r.ours]))
         self.assertIn('after-rebase failed', r.log)
 
-    def test_native_check_run_without_status_lands(self):
-        r = self.land([['none']], required=['source'], checks=[{'name': 'source', 'conclusion': 'success'}], workflows='source.yml')
+    def test_app_check_run_without_status_lands(self):
+        r = self.land([['none']], required=['source'], checks=[{'name': 'source', 'conclusion': 'success', 'app': {'id': 5}}], workflows='source.yml')
         self.assertEqual(r.code, 0, r.log)
         self.assertEqual(r.main, r.ours)
         self.assertEqual(len(r.dispatches), 1)
+
+    def test_dispatched_required_job_lands_as_a_commit_status(self):
+        # MR 2026-11-17, run 44198313344: GitHub refused main although the dispatched check run passed,
+        # because it counts no workflow_dispatch check run toward a ruleset. Only a commit status counts.
+        for rule in ['source', {'context': 'source', 'integration_id': 15368}]:
+            with self.subTest(rule=rule):
+                r = self.land([['none']], required=[rule], checks=[{'name': 'source', 'conclusion': 'success', 'app': {'id': 15368}}], workflows='source.yml')
+                self.assertEqual(r.code, 0, r.log)
+                self.assertEqual(r.main, r.ours)
+                self.assertEqual(r.posted, [['source', r.ours]])
+
+    def test_actions_check_run_alone_never_satisfies_main(self):
+        # The dispatched run passed but no job of it carries the required name: nothing GitHub counts exists.
+        r = self.land([['none']], required=['source'], checks=[{'name': 'source', 'conclusion': 'success', 'app': {'id': 15368}}], jobs=[{'name': 'other', 'conclusion': 'success'}], workflows='source.yml', minutes=0)
+        self.assertNotEqual(r.code, 0, r.log)
+        self.assertEqual((r.main, r.posted), (r.base, []))
+
+    def test_failed_or_skipped_job_is_never_reported(self):
+        for state in ['skipped', 'failure']:
+            with self.subTest(state):
+                r = self.land([['none']], required=['source'], checks=[{'name': 'source', 'conclusion': state, 'app': {'id': 15368}}], workflows='source.yml', minutes=0)
+                self.assertNotEqual(r.code, 0, r.log)
+                self.assertEqual((r.main, r.posted), (r.base, []))
 
     def test_missing_skipped_failed_or_pending_required_check_holds(self):
         for state in [None, 'skipped', 'failure', 'neutral']:
