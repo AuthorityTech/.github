@@ -13,7 +13,7 @@ stop() {
 for round in $(seq "$ROUNDS"); do
   sha=$(git rev-parse HEAD)
   git push --force origin "HEAD:refs/heads/$branch" || stop "pushing $branch failed"
-  declare -A dispatched_after=()
+  declare -A dispatched_after=() reported=()
   while IFS= read -r workflow_file; do
     [ -z "$workflow_file" ] && continue
     dispatched_after["$workflow_file"]=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$sha&event=workflow_dispatch&per_page=100" --jq '.workflow_runs | map(.id) | max // 0') || stop "reading prior $workflow_file runs failed"
@@ -35,23 +35,37 @@ for round in $(seq "$ROUNDS"); do
       status=$(jq --argjson ruled "$ruled" '.statuses |= map(select(.context == "Vercel" or (.context as $name | $ruled | any(.context == $name))))' <<< "$status")
     fi
     (( $(jq '.total_count' <<< "$status") <= 100 && $(jq '.total_count' <<< "$runs") <= 100 )) || stop "partial check read"
-    checks=$(jq -nc --argjson s "$status" --argjson c "$runs" '[$s.statuses[] | {name: .context, state, app: null}] + [$c.check_runs[] | {name, state: (.conclusion // "pending"), app: .app.id}]')
+    # GitHub counts no workflow_dispatch check run toward a ruleset, and a GITHUB_TOKEN push to land/ starts no
+    # other workflow, so a GitHub Actions check run here never satisfies main (counts: false). Its passed job is
+    # reported below as a commit status, which GitHub does count; that status is this token's, the GitHub Actions app.
+    reported_json=$(printf '%s\n' "${!reported[@]}" | jq -Rsc 'split("\n") | map(select(. != ""))')
+    checks=$(jq -nc --argjson s "$status" --argjson c "$runs" --argjson mine "$reported_json" '[$s.statuses[] | {name: .context, state, app: (if .context as $n | $mine | index($n) then 15368 else null end), counts: true}] + [$c.check_runs[] | {name, state: (.conclusion // "pending"), app: .app.id, counts: (.app.id != 15368)}]')
     if jq -e 'any(.[]; .state == "failure" or .state == "error" or .state == "cancelled" or .state == "timed_out" or .state == "action_required" or .state == "startup_failure")' <<< "$checks" >/dev/null; then
       stop "a check failed for $sha: $checks"
     fi
     ready=true
     while IFS= read -r workflow_file; do
       [ -z "$workflow_file" ] && continue
-      dispatched=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$sha&event=workflow_dispatch&per_page=100" --jq '[.workflow_runs[] | select(.head_sha == "'"$sha"'" and .id > '"${dispatched_after[$workflow_file]}"')] | sort_by(.id) | last | .conclusion // "pending"') || stop "reading dispatched $workflow_file failed"
+      latest=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$sha&event=workflow_dispatch&per_page=100" --jq '[.workflow_runs[] | select(.head_sha == "'"$sha"'" and .id > '"${dispatched_after[$workflow_file]}"')] | sort_by(.id) | last | "\(.id // 0) \(.conclusion // "pending")"') || stop "reading dispatched $workflow_file failed"
+      read -r run_id dispatched <<< "$latest"
       case "$dispatched" in
-        success) ;;
+        success)
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" --jq '.jobs[] | select(.conclusion == "success") | "\(.name)\t\(.html_url)"') || stop "reading $workflow_file jobs failed"
+          while IFS=$'\t' read -r job url; do
+            [ -z "$job" ] || [ -n "${reported[$job]:-}" ] && continue
+            jq -e --arg n "$job" 'any(.[]; .context == $n)' <<< "$ruled" >/dev/null || continue
+            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$sha" -f state=success -f context="$job" -f description="$workflow_file passed on this commit" -f target_url="$url" </dev/null >/dev/null || stop "reporting $job as a commit status failed (the caller needs statuses: write)"
+            reported[$job]=1
+            ready=false
+          done <<< "$jobs"
+          ;;
         pending) ready=false ;;
         *) stop "$workflow_file concluded $dispatched for $sha" ;;
       esac
     done <<< "${CHECK_WORKFLOWS:-}"
     if [ "$ready" = true ] && jq -e --argjson required "$ruled" '
       . as $checks | all(.[]; .state == "success" or .state == "skipped" or .state == "neutral") and
-      all($required[]; . as $rule | [$checks[] | select(.name == $rule.context and (($rule.integration_id // 0) <= 0 or .app == $rule.integration_id))] | length > 0 and all(.[]; .state == "success"))
+      all($required[]; . as $rule | [$checks[] | select(.counts and .name == $rule.context and (($rule.integration_id // 0) <= 0 or .app == $rule.integration_id))] | length > 0 and all(.[]; .state == "success"))
     ' <<< "$checks" >/dev/null; then break; fi
     [ "$(date +%s)" -lt "$deadline" ] || stop "checks still pending for $sha after $BUILD_MINUTES min"
     sleep 15
