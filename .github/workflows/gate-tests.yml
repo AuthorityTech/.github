@@ -1,15 +1,11 @@
 name: Publication gate regressions
 
+# Every pull request runs the whole suite, and main's ruleset requires `test`, so a change to
+# any shared action or workflow (editorial-merge-paths.yml had no test run at all) waits for it
+# and a hand merge cannot land a red gate on every site that uses these actions.
 on:
   pull_request:
-    paths:
-      - .github/workflows/dependabot-automerge.yml
-      - .github/workflows/gate-tests.yml
-      - tests/test_publication_gate.py
-      - .github/actions/land-checked/**
-      - tests/test_land_checked.py
-      - .github/actions/site-integrity/**
-      - tests/test_site_integrity.py
+    branches: [main]
 
 permissions:
   contents: read
