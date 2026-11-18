@@ -480,6 +480,23 @@ class PublicationGate(unittest.TestCase):
         self.assertFalse(merged)
         self.assertEqual(sum('/status?' in str(c) for c in calls), 4, 'four tries, then the 404 stands')
 
+    def test_an_empty_read_body_is_retried_and_the_head_still_merges(self):
+        # gh answers "unexpected end of JSON input" when a read's 200 body is empty: it
+        # failed machinerelations.ai's resolve on its first read on 2026-11-18. Retried
+        # like a 5xx or a 404.
+        empty = 'unexpected end of JSON input'
+        pull = dict(number=1, state='open', draft=False, head=dict(sha=HEAD, ref='editorial/post', repo=dict(full_name=REPO)), base=dict(ref='main'))
+        f = fixture(); f['commit_pulls'] = [pull]; f['fail'] = {'repos/' + REPO: dict(times=1, message=empty)}
+        self.assertEqual(self.resolve(f), [dict(number=1, sha=HEAD, kind='editorial')])
+        baseline = self.run_gate()[2]
+        for key in ['/pulls/', '/status?', '/check-runs?']:
+            f = fixture(); f['fail'] = {key: dict(times=1, message=empty)}
+            with self.subTest(key=key):
+                r, merged, calls = self.run_gate(f)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertTrue(merged, r.stdout + r.stderr)
+                self.assertEqual(sum(key in str(c) for c in calls), sum(key in str(c) for c in baseline) + 1)
+
     def test_client_errors_and_writes_are_never_retried_by_the_read_wrapper(self):
         f = fixture(); f['fail'] = {'/status?': dict(times=99, message='Forbidden (HTTP 403)')}
         r, merged, calls = self.run_gate(f)
