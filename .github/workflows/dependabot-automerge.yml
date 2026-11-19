@@ -595,6 +595,14 @@ jobs:
               fi
               refusal=$(cat "$RUNNER_TEMP/merge.err" 2>/dev/null || true)
               echo "Merge attempt $attempt refused: $refusal"
+              # GitHub recomputes mergeable after the base moves, so a read can still show
+              # it unknown while the merge is already refused for conflicts. The refusal
+              # settles it: a conflict is the author's, as in pr_state (jaxonparrott.com
+              # #329, 2026-11-19: four refusals, then a red gate run on main).
+              if [[ $refusal == *"merge conflicts"* ]]; then
+                echo "::notice::Not merging #$PR: it is conflicting; GitHub refused the merge of $SHA for conflicts with its base."
+                exit 0
+              fi
               sleep $((attempt * 3))
               state=$(pr_state)
               case $state in
@@ -649,10 +657,13 @@ jobs:
               fi
               # GitHub refuses this merge unless the head is still $SHA. A refusal
               # or a concurrent merge is settled by reading the PR back.
-              gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$SHA" || true
+              gh pr merge "$PR" --repo "$REPO" --squash --match-head-commit "$SHA" 2>"$RUNNER_TEMP/merge.err" ||
+                cat "$RUNNER_TEMP/merge.err" >&2
               for _ in 1 2 3 4 5; do
                 state=$(pr_state)
                 [[ $state == open ]] || break
+                # A refusal for conflicts can come before the read shows mergeable false.
+                grep -q 'merge conflicts' "$RUNNER_TEMP/merge.err" && { state=conflicting; break; }
                 sleep 3
               done
               case $state in

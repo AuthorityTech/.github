@@ -33,7 +33,7 @@ for key, spec in f.get('fail', {}).items():
         sys.stderr.write('gh: ' + spec.get('message', 'Server Error (HTTP 502)') + '\\n')
         sys.exit(1)
 if a[:2] == ['pr', 'merge']:
-    if f['pr'].get('mergeable') is False:
+    if f['pr'].get('mergeable') is False or f.get('conflict_on_merge'):
         sys.stderr.write('gh: Pull Request has merge conflicts (HTTP 405)\\n'); sys.exit(1)
     assert '--match-head-commit' in a and a[a.index('--match-head-commit')+1] == 'a'*40
     assert '--repo' in a and a[a.index('--repo')+1] == os.environ['REPO']
@@ -43,7 +43,7 @@ if a[:2] == ['pr', 'merge']:
     sys.exit(0)
 if a[0] != 'api': sys.exit('unexpected non-API command')
 if '-X' in a and a[a.index('-X')+1] == 'PUT':
-    if f['pr'].get('mergeable') is False:
+    if f['pr'].get('mergeable') is False or f.get('conflict_on_merge'):
         sys.stderr.write('gh: Pull Request has merge conflicts (HTTP 405)\\n'); sys.exit(1)
     if f.get('refuse_merge'):
         f['pr']['head']['sha'] = 'c'*40
@@ -342,6 +342,21 @@ class PublicationGate(unittest.TestCase):
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
                 self.assertFalse(attempted, r.stdout)
                 self.assertIn('conflicting', r.stdout)
+                self.assertFalse(any('/dispatches' in str(c) or '/git/refs' in str(c) for c in calls))
+
+    # 2026-11-19: jaxonparrott.com #329's base moved a minute before its gate run. Every read showed
+    # mergeable unknown while GitHub refused the merge four times for conflicts, and the gate failed
+    # red on main. The refusal is GitHub's answer: a notice and success, as for a read that shows it.
+    def test_a_merge_refused_for_conflicts_before_the_read_shows_them_succeeds(self):
+        for kind, required in [('editorial', None), ('dependabot', [])]:
+            f = fixture(); f['conflict_on_merge'] = True
+            f['statuses'] = [dict(context='Vercel', state='success')]
+            if kind == 'dependabot': f['pr']['user'] = {'login': 'dependabot[bot]'}
+            with self.subTest(kind=kind):
+                r, attempted, calls = self.run_gate(f, kind=kind, required=required)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn('conflict', r.stdout)
+                self.assertEqual(sum(('-X' in c and 'PUT' in c) or c[:2] == ['pr', 'merge'] for c in calls), 1, r.stdout)
                 self.assertFalse(any('/dispatches' in str(c) or '/git/refs' in str(c) for c in calls))
 
     def test_a_dispatch_that_fails_after_the_claim_still_fails_the_evaluation(self):
