@@ -63,12 +63,20 @@ def ref(name):
 if sha not in f['seen']:
     f['seen'].append(sha)
 build = f['seen'].index(sha)
+retry_ref = ref('refs/heads/' + os.environ['BRANCH'] + '-retry')
 n = sum(1 for r in f['reads'] if r['sha'] == sha)
-f['reads'].append({'sha': sha, 'main': ref('refs/heads/main'), 'land': ref('refs/heads/' + os.environ['BRANCH'])})
+f['reads'].append({'sha': sha, 'main': ref('refs/heads/main'), 'land': ref('refs/heads/' + os.environ['BRANCH']), 'retry': retry_ref})
 if f['move_to'] and len(f['reads']) == 1:
     subprocess.run(['git', '--git-dir', os.environ['ORIGIN'], 'update-ref', 'refs/heads/main', f['move_to']], check=True)
 (root / 'fixture.json').write_text(json.dumps(f))
-states = f['builds'][min(build, len(f['builds']) - 1)][:n + 1]
+if f.get('drop_first_push'):
+    if retry_ref != sha:
+        states = ['none']
+    else:
+        m = sum(1 for r in f['reads'] if r['sha'] == sha and r.get('retry') == sha) - 1
+        states = f['builds'][min(build, len(f['builds']) - 1)][:m + 1]
+else:
+    states = f['builds'][min(build, len(f['builds']) - 1)][:n + 1]
 statuses = [{'context': 'Vercel', 'state': s, 'target_url': 'https://vercel.example/' + s} for s in reversed(states) if s != 'none']
 statuses = list({s['context']: s for s in reversed(statuses)}.values()) + f.get('extra_statuses', [])
 out = json.dumps({'total_count': len(statuses), 'statuses': statuses})
@@ -83,7 +91,7 @@ class LandChecked(unittest.TestCase):
     def setUpClass(cls):
         assert shutil.which('jq'), 'the gh stub applies --jq with jq, as gh does'
 
-    def land(self, builds, other=None, rounds=6, minutes=15, after_rebase='', required=None, checks=None, workflows='', dispatch_state='success', extra_statuses=None, jobs=None):
+    def land(self, builds, other=None, rounds=6, minutes=15, after_rebase='', required=None, checks=None, workflows='', dispatch_state='success', extra_statuses=None, jobs=None, drop_first_push=False, fake_clock=False):
         """Lands one producer commit; builds lists Vercel's states per distinct commit, read by read.
         other ('add' or 'conflict') is another writer's commit, which becomes main at the first read."""
         d = Path(tempfile.mkdtemp())
@@ -115,10 +123,19 @@ class LandChecked(unittest.TestCase):
 
         stubs = d / 'bin'
         stubs.mkdir()
-        for name, body in [('gh', GH), ('sleep', '#!/bin/sh\nexit 0\n')]:
+        stub_files = [('gh', GH)]
+        if fake_clock:
+            (d / 'clock').write_text('1000\n')
+            stub_files.extend([
+                ('sleep', '#!/bin/sh\nval=$(cat "$FIXTURE/clock")\necho $((val + ${1:-0})) > "$FIXTURE/clock"\n'),
+                ('date', '#!/bin/sh\nif [ "$1" = "+%s" ]; then cat "$FIXTURE/clock"; else exec /bin/date "$@"; fi\n'),
+            ])
+        else:
+            stub_files.append(('sleep', '#!/bin/sh\nexit 0\n'))
+        for name, body in stub_files:
             (stubs / name).write_text(body)
             (stubs / name).chmod(0o755)
-        (d / 'fixture.json').write_text(json.dumps(dict(builds=builds, move_to=move_to, seen=[], reads=[], required=required if required is not None else ['Vercel'], checks=checks or [], dispatch_state=dispatch_state, extra_statuses=extra_statuses or [], **({'jobs': jobs} if jobs is not None else {}))))
+        (d / 'fixture.json').write_text(json.dumps(dict(builds=builds, move_to=move_to, seen=[], reads=[], required=required if required is not None else ['Vercel'], checks=checks or [], dispatch_state=dispatch_state, extra_statuses=extra_statuses or [], drop_first_push=drop_first_push, **({'jobs': jobs} if jobs is not None else {}))))
         output = d / 'output'
         output.write_text('')
         env.update(PATH=str(stubs) + os.pathsep + env['PATH'], FIXTURE=str(d), ORIGIN=str(origin), BRANCH=BRANCH,
@@ -135,7 +152,7 @@ class LandChecked(unittest.TestCase):
 
         return SimpleNamespace(
             code=result.returncode, log=result.stdout + result.stderr, base=base, ours=ours, other=move_to,
-            main=at('refs/heads/main'), land=at('refs/heads/' + BRANCH), seen=f['seen'], reads=f['reads'], dispatches=f.get('dispatches', []), posted=f.get('posted', []),
+            main=at('refs/heads/main'), land=at('refs/heads/' + BRANCH), retry=at('refs/heads/' + BRANCH + '-retry'), seen=f['seen'], reads=f['reads'], dispatches=f.get('dispatches', []), posted=f.get('posted', []),
             outputs=dict(line.split('=', 1) for line in output.read_text().splitlines()),
             git=lambda *args: git(work, *args), work=work)
 
@@ -274,6 +291,36 @@ class LandChecked(unittest.TestCase):
         r = self.land([['success'], ['success']], workflows='source.yml', other='add')
         self.assertEqual(r.code, 0, r.log)
         self.assertEqual(len(r.dispatches), 2)
+
+
+    def test_dropped_vercel_push_repushes_once_and_lands(self):
+        # Paralax 2026-11-24, run 45454039738: GitHub dropped the push webhook for land/,
+        # so Vercel never started a preview deployment and never posted a status.
+        r = self.land([['pending', 'success']], minutes=5, drop_first_push=True, fake_clock=True)
+        self.assertEqual(r.code, 0, r.log)
+        self.assertEqual(r.main, r.ours)
+        self.assertIsNone(r.land)
+        self.assertIsNone(r.retry)
+        self.assertEqual(r.outputs, {'sha': r.ours, 'landed': 'true'})
+        self.assertTrue(all(x['land'] == r.ours for x in r.reads))
+        self.assertEqual([x['retry'] for x in r.reads[:5]], [None] * 5)
+        self.assertEqual([x['retry'] for x in r.reads[5:]], [r.ours, r.ours])
+        self.assertEqual(r.log.count('pushing ' + BRANCH + '-retry once'), 1)
+
+    def test_pending_vercel_status_never_repushes(self):
+        r = self.land([['pending', 'pending', 'pending', 'pending', 'pending', 'success']], minutes=5, fake_clock=True)
+        self.assertEqual(r.code, 0, r.log)
+        self.assertEqual(r.main, r.ours)
+        self.assertIsNone(r.retry)
+        self.assertTrue(all(x['retry'] is None for x in r.reads))
+        self.assertNotIn('-retry', r.log)
+
+    def test_dropped_vercel_after_repush_still_fails_visibly(self):
+        r = self.land([['none']], minutes=5, drop_first_push=True, fake_clock=True)
+        self.assertEqual(r.code, 1, r.log)
+        self.assertEqual((r.main, r.land, r.retry, r.outputs), (r.base, r.ours, None, {}))
+        self.assertEqual(r.log.count('pushing ' + BRANCH + '-retry once'), 1)
+        self.assertIn('checks still pending for ' + r.ours + ' after 5 min', r.log)
 
 
 if __name__ == '__main__':
