@@ -4,8 +4,11 @@ set -euo pipefail
 
 workflow=$(basename "${GITHUB_WORKFLOW_REF%@*}")
 branch="land/${workflow%.*}/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+retry_branch="${branch}-retry"
+used_retry=false
 
 stop() {
+  [ "$used_retry" = true ] && git push origin --delete "$retry_branch" 2>/dev/null || true
   echo "::error::$1; main untouched, $branch kept"
   exit 1
 }
@@ -20,7 +23,10 @@ for round in $(seq "$ROUNDS"); do
     gh workflow run "$workflow_file" --repo "$GITHUB_REPOSITORY" --ref "$branch" || stop "dispatching $workflow_file failed"
   done <<< "${CHECK_WORKFLOWS:-}"
   echo "Check $round of $ROUNDS: waiting up to $BUILD_MINUTES min on $sha ($branch)"
-  deadline=$(( $(date +%s) + BUILD_MINUTES * 60 ))
+  started=$(date +%s)
+  deadline=$(( started + BUILD_MINUTES * 60 ))
+  repush_at=$(( started + 60 ))
+  repushed=false
   while :; do
     ruled=$(gh api --paginate "repos/$GITHUB_REPOSITORY/rules/branches/main" --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]' | jq -sc 'unique_by(.context, .integration_id)') || stop "reading main requirements failed"
     # Existing sites without a native required context retain their build gate.
@@ -67,11 +73,22 @@ for round in $(seq "$ROUNDS"); do
       . as $checks | all(.[]; .state == "success" or .state == "skipped" or .state == "neutral") and
       all($required[]; . as $rule | [$checks[] | select(.counts and .name == $rule.context and (($rule.integration_id // 0) <= 0 or .app == $rule.integration_id))] | length > 0 and all(.[]; .state == "success"))
     ' <<< "$checks" >/dev/null; then break; fi
-    [ "$(date +%s)" -lt "$deadline" ] || stop "checks still pending for $sha after $BUILD_MINUTES min"
+    now=$(date +%s)
+    [ "$now" -lt "$deadline" ] || stop "checks still pending for $sha after $BUILD_MINUTES min"
+    # GitHub occasionally drops the push webhook to Vercel (~1%); Vercel posts pending within seconds when it arrives.
+    if [ "$repushed" = false ] && [ "$now" -ge "$repush_at" ] && jq -e 'any(.[]; .context == "Vercel")' <<< "$ruled" >/dev/null && ! jq -e 'any(.[]; .name == "Vercel")' <<< "$checks" >/dev/null; then
+      repushed=true
+      echo "No Vercel status for $sha after 60s; pushing $retry_branch once to re-trigger Vercel."
+      git push --force origin "HEAD:refs/heads/$retry_branch" || stop "pushing $retry_branch failed"
+      used_retry=true
+    fi
     sleep 15
   done
   if git push origin HEAD:main; then
     git push origin --delete "$branch" || echo "::warning::$sha landed, but $branch could not be deleted"
+    if [ "$used_retry" = true ]; then
+      git push origin --delete "$retry_branch" || echo "::warning::$sha landed, but $retry_branch could not be deleted"
+    fi
     { echo "sha=$sha"; echo "landed=true"; } >> "$GITHUB_OUTPUT"
     echo "Landed $sha on main."
     exit 0
