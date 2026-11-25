@@ -114,7 +114,10 @@ elif '/pulls/' in url:
     else: output(p)
 elif '/actions/runs?' in url:
     assert 'head_sha=' + 'a'*40 in url
-    output([99])
+    output(f.get('own_listed', [99]))
+elif '/actions/runs/' in url:
+    assert url.endswith('/actions/runs/4242'), url
+    output(f.get('self_suite', 99))
 elif '/check-runs?' in url:
     assert '/commits/' + 'a'*40 + '/' in url
     read_file = pathlib.Path(os.environ.get('RUNNER_TEMP', root)) / 'check_reads'
@@ -148,7 +151,7 @@ class PublicationGate(unittest.TestCase):
             (root / 'fixture.json').write_text(json.dumps(f))
             for name, script in [('gh', MOCK), ('sleep', '#!/bin/sh\nexit 0\n')]:
                 p = root / name; p.write_text(script); p.chmod(0o755)
-            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, GH_TOKEN='local-fixture-only', REPO=repo, PR='1', SHA=HEAD, KIND=kind, REQUIRED='\n'.join(['Vercel', *NAMES] if required is None else required), CONTENT_WITHOUT_PREVIEW=enabled, WORKFLOW_REF=repo + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE=trigger, BASE_REF='main', TOGETHER=str(together))
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, GH_TOKEN='local-fixture-only', GITHUB_RUN_ID='4242', REPO=repo, PR='1', SHA=HEAD, KIND=kind, REQUIRED='\n'.join(['Vercel', *NAMES] if required is None else required), CONTENT_WITHOUT_PREVIEW=enabled, WORKFLOW_REF=repo + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE=trigger, BASE_REF='main', TOGETHER=str(together))
             def evaluate(i):
                 temp = root / f'runner-{i}'; temp.mkdir()  # each job has its own RUNNER_TEMP
                 return subprocess.run(['bash', '-c', SCRIPT], env=dict(env, RUNNER_TEMP=str(temp)), text=True, capture_output=True, timeout=10)
@@ -164,7 +167,7 @@ class PublicationGate(unittest.TestCase):
             (root / 'fixture.json').write_text(json.dumps(f))
             for name, script in [('gh', MOCK), ('sleep', '#!/bin/sh\nexit 0\n')]:
                 p = root / name; p.write_text(script); p.chmod(0o755)
-            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, RUNNER_TEMP=d, GH_TOKEN='local-fixture-only', REPO=repo, PR='1', SHA=HEAD, KIND=kind, REQUIRED='\n'.join(['Vercel', *NAMES] if required is None else required), CONTENT_WITHOUT_PREVIEW=enabled, WORKFLOW_REF=repo + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE=trigger, BASE_REF='main')
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, RUNNER_TEMP=d, GH_TOKEN='local-fixture-only', GITHUB_RUN_ID='4242', REPO=repo, PR='1', SHA=HEAD, KIND=kind, REQUIRED='\n'.join(['Vercel', *NAMES] if required is None else required), CONTENT_WITHOUT_PREVIEW=enabled, WORKFLOW_REF=repo + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE=trigger, BASE_REF='main')
             out = []
             for _ in range(rounds):
                 log = root / 'calls.jsonl'
@@ -251,7 +254,7 @@ class PublicationGate(unittest.TestCase):
             for name, script in [('gh', MOCK), ('sleep', '#!/bin/sh\nexit 0\n')]:
                 p = root / name; p.write_text(script); p.chmod(0o755)
             out = root / 'output'
-            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, GH_TOKEN='local-fixture-only', REPO=REPO, EVENT='status', PR='', PR_SHA='', PR_AUTHOR='', SHA=HEAD, GITHUB_OUTPUT=str(out))
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, GH_TOKEN='local-fixture-only', GITHUB_RUN_ID='4242', REPO=REPO, EVENT='status', PR='', PR_SHA='', PR_AUTHOR='', SHA=HEAD, GITHUB_OUTPUT=str(out))
             r = subprocess.run(['bash', '-c', RESOLVE], env=env, text=True, capture_output=True, timeout=10)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertEqual(json.loads(out.read_text().split('prs=', 1)[1]), [dict(number=1, sha=HEAD, kind='editorial'), dict(number=4, sha=HEAD, kind='editorial')])
@@ -458,7 +461,7 @@ class PublicationGate(unittest.TestCase):
         baseline = self.run_gate()[2]
         messages = ['Server Error (HTTP 502)', 'HTTP 503: Service Unavailable',
                     'Get "https://api.github.com/x": read tcp 10.0.0.1:443: connection reset by peer']
-        for key in ['/rules/branches/', '/pulls/', '/files?', '/status?', '/actions/runs?', '/check-runs?']:
+        for key in ['/rules/branches/', '/pulls/', '/files?', '/status?', '/actions/runs?', '/actions/runs/', '/check-runs?']:
             for message in messages:
                 f = fixture(); f['fail'] = {key: dict(times=1, message=message)}
                 with self.subTest(key=key, message=message):
@@ -534,7 +537,7 @@ class PublicationGate(unittest.TestCase):
                 for name, script in [('gh', MOCK), ('sleep', '#!/bin/sh\nexit 0\n')]:
                     p = root / name; p.write_text(script); p.chmod(0o755)
                 out = root / 'output'
-                env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, GH_TOKEN='local-fixture-only', REPO=REPO, EVENT='workflow_run', PR='', PR_SHA='', PR_AUTHOR='', SHA=HEAD, GITHUB_OUTPUT=str(out))
+                env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, GH_TOKEN='local-fixture-only', GITHUB_RUN_ID='4242', REPO=REPO, EVENT='workflow_run', PR='', PR_SHA='', PR_AUTHOR='', SHA=HEAD, GITHUB_OUTPUT=str(out))
                 r = subprocess.run(['bash', '-c', RESOLVE], env=env, text=True, capture_output=True, timeout=10)
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
                 self.assertEqual(json.loads(out.read_text().split('prs=', 1)[1]), [dict(number=1, sha=HEAD, kind='editorial')])
@@ -547,7 +550,7 @@ class PublicationGate(unittest.TestCase):
                 p = root / name; p.write_text(script); p.chmod(0o755)
             out = root / 'output'
             pr = event == 'pull_request_target'
-            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, GH_TOKEN='local-fixture-only', REPO=REPO, EVENT=event, PR='1' if pr else '', PR_SHA=HEAD if pr else '', PR_AUTHOR=author, SHA='' if pr else HEAD, GITHUB_OUTPUT=str(out), WORKFLOW_REF=REPO + '/.github/workflows/dependabot-automerge.yml@main', TRIGGER_SUITE=trigger)
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ['PATH'], FIXTURE=d, GH_TOKEN='local-fixture-only', GITHUB_RUN_ID='4242', REPO=REPO, EVENT=event, PR='1' if pr else '', PR_SHA=HEAD if pr else '', PR_AUTHOR=author, SHA='' if pr else HEAD, GITHUB_OUTPUT=str(out), WORKFLOW_REF=REPO + '/.github/workflows/dependabot-automerge.yml@main', TRIGGER_SUITE=trigger)
             r = subprocess.run(['bash', '-c', RESOLVE], env=env, text=True, capture_output=True, timeout=10)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             return json.loads(out.read_text().split('prs=', 1)[1])
@@ -579,6 +582,25 @@ class PublicationGate(unittest.TestCase):
         self.assertEqual(self.resolve(f(runs=[('site-integrity / schema', 2)]), 'pull_request_target', author='writer-seat'), [])
         # A Dependabot PR's merge job waits for its checks and keeps its label; it always starts.
         self.assertEqual(self.resolve(f(runs=[('site-integrity / schema', 2)]), 'pull_request_target', author='dependabot[bot]'), [dict(number=1, sha=HEAD, kind='dependabot')])
+
+    # 2026-11-24: website #1491 turned ready, and its only evaluation read its own resolve check as
+    # still running: the head_sha listing did not show the run yet, and the gate's own completion
+    # starts no evaluation, so the head sat green and unmerged for five hours. This run is its own
+    # by its id, whatever the listing shows; another run still in progress holds as before.
+    def test_this_run_is_its_own_when_the_listing_misses_it(self):
+        pull = dict(number=1, state='open', draft=False, user=dict(login='writer-seat'), head=dict(sha=HEAD, ref='editorial/post', repo=dict(full_name=REPO)), base=dict(ref='main'))
+        one = [dict(number=1, sha=HEAD, kind='editorial')]
+        for job in ['automerge / resolve', 'automerge / merge (#1)']:
+            f = fixture(); f['commit_pulls'] = [pull]
+            f['runs'].append(dict(name=job, conclusion=None, check_suite=dict(id=7)))
+            f['own_listed'] = []; f['self_suite'] = 7
+            with self.subTest(job=job):
+                self.assertEqual(self.resolve(f, 'pull_request_target', author='writer-seat'), one)
+                r, merged, _ = self.run_gate(f)
+                self.assertTrue(merged, r.stdout + r.stderr)
+                f['self_suite'] = 8
+                self.assertEqual(self.resolve(f, 'pull_request_target', author='writer-seat'), [])
+                self.assert_held(f)
 
     # Listing Vercel does not make a missing or skipped page-check a hold. It notes
     # that the run did not judge, and merges. A finished failure still stops the merge.
@@ -758,7 +780,7 @@ class PublicationGate(unittest.TestCase):
                     p = root / name
                     p.write_text(script)
                     p.chmod(0o755)
-                env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'], FIXTURE=str(root), RUNNER_TEMP=str(root), GH_TOKEN='local-fixture-only', REPO=REPO, PR='1', SHA=HEAD, KIND='editorial', REQUIRED='\n'.join(['Vercel', *NAMES]), CONTENT_WITHOUT_PREVIEW='true', WORKFLOW_REF=REPO + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE='', BASE_REF='main', GITHUB_STEP_SUMMARY=str(root / 'summary.md'))
+                env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'], FIXTURE=str(root), RUNNER_TEMP=str(root), GH_TOKEN='local-fixture-only', GITHUB_RUN_ID='4242', REPO=REPO, PR='1', SHA=HEAD, KIND='editorial', REQUIRED='\n'.join(['Vercel', *NAMES]), CONTENT_WITHOUT_PREVIEW='true', WORKFLOW_REF=REPO + '/.github/workflows/dependabot-automerge.yml@main', WAIT_MINUTES='0', TRIGGER_SUITE='', BASE_REF='main', GITHUB_STEP_SUMMARY=str(root / 'summary.md'))
                 procs.append(subprocess.Popen(['bash', '-c', SCRIPT], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
             for proc, d in zip(procs, dirs):
                 stdout, stderr = proc.communicate(timeout=15)
