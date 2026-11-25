@@ -251,11 +251,16 @@ jobs:
           # (its read can lag the event) are not counted. A failed or partial read keeps
           # the PR, and the merge step judges it as before.
           still_running() {
-            local caller own runs status
+            local caller own self runs status
             caller="${WORKFLOW_REF:-}"; caller="${caller#"$REPO/"}"
             caller="${caller%%@*}"
             own=$(gh api "repos/$REPO/actions/runs?head_sha=$1&per_page=100" \
               --jq "[.workflow_runs[] | select(.path == \"$caller\") | .check_suite_id]") || return 1
+            # This run is read by its id too: the listing can miss a run that started
+            # seconds ago, and its own resolve check then reads as still running
+            # (website #1491 sat green and unmerged for five hours on 2026-11-24).
+            self=$(gh api "repos/$REPO/actions/runs/$GITHUB_RUN_ID" --jq .check_suite_id) || return 1
+            own=$(jq -c --argjson self "$self" '. + [$self]' <<<"$own")
             runs=$(gh api "repos/$REPO/commits/$1/check-runs?per_page=100") || return 1
             status=$(gh api "repos/$REPO/commits/$1/status?per_page=100") || return 1
             jq -en --argjson own "$own" --arg trigger "${TRIGGER_SUITE:-}" --argjson runs "$runs" --argjson status "$status" '
@@ -473,6 +478,9 @@ jobs:
             # one, and earlier ones), so the gate never waits on or vetoes itself.
             own=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" \
               --jq "[.workflow_runs[] | select(.path == \"$caller\") | .check_suite_id]")
+            # This run by its id too: the listing can miss a run that just started.
+            self=$(gh api "repos/$REPO/actions/runs/$GITHUB_RUN_ID" --jq .check_suite_id)
+            own=$(jq -c --argjson self "$self" '. + [$self]' <<<"$own")
             runs=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100")
             checks=$(jq -c --argjson own "$own" '[.check_runs[] | select(.check_suite.id as $s | $own | index($s) | not)
               | {name, state: (.conclusion // "pending")}]' <<<"$runs")
