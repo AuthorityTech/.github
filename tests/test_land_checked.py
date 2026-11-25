@@ -47,7 +47,13 @@ if '/actions/workflows/' in a[1]:
     sha = a[1].split('head_sha=')[1].split('&')[0]
     runs = [{'id': 10, 'head_sha': sha, 'conclusion': 'success'}]
     if a[-1] != '.workflow_runs | map(.id) | max // 0' and f.get('dispatch_state') != 'missing':
-        runs.append({'id': 11, 'head_sha': sha, 'conclusion': None if f.get('dispatch_state') == 'pending' else f.get('dispatch_state', 'success')})
+        if f.get('running_reads', 0) > 0:
+            f['running_reads'] -= 1
+            (root / 'fixture.json').write_text(json.dumps(f))
+            runs.append({'id': 11, 'head_sha': sha, 'status': 'in_progress', 'conclusion': None})
+        else:
+            pending = f.get('dispatch_state') == 'pending'
+            runs.append({'id': 11, 'head_sha': sha, 'status': 'queued' if pending else 'completed', 'conclusion': None if pending else f.get('dispatch_state', 'success')})
     out = subprocess.run(['jq', '-r', a[-1]], input=json.dumps({'workflow_runs': runs}), capture_output=True, text=True, check=True)
     sys.stdout.write(out.stdout)
     sys.exit(0)
@@ -91,7 +97,7 @@ class LandChecked(unittest.TestCase):
     def setUpClass(cls):
         assert shutil.which('jq'), 'the gh stub applies --jq with jq, as gh does'
 
-    def land(self, builds, other=None, rounds=6, minutes=15, after_rebase='', required=None, checks=None, workflows='', dispatch_state='success', extra_statuses=None, jobs=None, drop_first_push=False, fake_clock=False):
+    def land(self, builds, other=None, rounds=6, minutes=15, after_rebase='', required=None, checks=None, workflows='', dispatch_state='success', extra_statuses=None, jobs=None, drop_first_push=False, fake_clock=False, running_reads=0):
         """Lands one producer commit; builds lists Vercel's states per distinct commit, read by read.
         other ('add' or 'conflict') is another writer's commit, which becomes main at the first read."""
         d = Path(tempfile.mkdtemp())
@@ -135,7 +141,7 @@ class LandChecked(unittest.TestCase):
         for name, body in stub_files:
             (stubs / name).write_text(body)
             (stubs / name).chmod(0o755)
-        (d / 'fixture.json').write_text(json.dumps(dict(builds=builds, move_to=move_to, seen=[], reads=[], required=required if required is not None else ['Vercel'], checks=checks or [], dispatch_state=dispatch_state, extra_statuses=extra_statuses or [], drop_first_push=drop_first_push, **({'jobs': jobs} if jobs is not None else {}))))
+        (d / 'fixture.json').write_text(json.dumps(dict(builds=builds, move_to=move_to, seen=[], reads=[], required=required if required is not None else ['Vercel'], checks=checks or [], dispatch_state=dispatch_state, extra_statuses=extra_statuses or [], drop_first_push=drop_first_push, running_reads=running_reads, **({'jobs': jobs} if jobs is not None else {}))))
         output = d / 'output'
         output.write_text('')
         env.update(PATH=str(stubs) + os.pathsep + env['PATH'], FIXTURE=str(d), ORIGIN=str(origin), BRANCH=BRANCH,
@@ -286,6 +292,13 @@ class LandChecked(unittest.TestCase):
             r = self.land([['success']], workflows='source.yml', dispatch_state=state, minutes=0)
             self.assertNotEqual(r.code, 0, r.log)
             self.assertEqual(r.main, r.base)
+
+    def test_running_dispatch_is_waited_for_past_build_minutes(self):
+        # MR 2026-11-25, run 45568848156: Build tests ran 18 min after #873 added next build and the page check;
+        # land-checked stopped at 15 while the run was still going, and it then passed.
+        r = self.land([['success']], workflows='source.yml', running_reads=3, minutes=0)
+        self.assertEqual(r.code, 0, r.log)
+        self.assertEqual(r.main, r.ours)
 
     def test_dispatch_is_repeated_after_rebase(self):
         r = self.land([['success'], ['success']], workflows='source.yml', other='add')
