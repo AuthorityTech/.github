@@ -299,6 +299,11 @@ class LandChecked(unittest.TestCase):
         r = self.land([['success']], workflows='source.yml', running_reads=3, minutes=0)
         self.assertEqual(r.code, 0, r.log)
         self.assertEqual(r.main, r.ours)
+        # Run 45574644160: the run passed after the deadline, its required job was posted as a status,
+        # and the deadline stopped the pass that would have read it.
+        r = self.land([['none']], required=['source'], checks=[{'name': 'source', 'conclusion': 'success', 'app': {'id': 15368}}], workflows='source.yml', running_reads=3, minutes=0)
+        self.assertEqual(r.code, 0, r.log)
+        self.assertEqual((r.main, r.posted), (r.ours, [['source', r.ours]]))
 
     def test_dispatch_is_repeated_after_rebase(self):
         r = self.land([['success'], ['success']], workflows='source.yml', other='add')

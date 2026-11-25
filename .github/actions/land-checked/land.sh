@@ -64,6 +64,7 @@ for round in $(seq "$ROUNDS"); do
             gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$sha" -f state=success -f context="$job" -f description="$workflow_file passed on this commit" -f target_url="$url" </dev/null >/dev/null || stop "reporting $job as a commit status failed (the caller needs statuses: write)"
             reported[$job]=1
             ready=false
+            running=true # the status just posted is read on the next pass, however late the run finished
           done <<< "$jobs"
           ;;
         pending)
@@ -78,8 +79,9 @@ for round in $(seq "$ROUNDS"); do
       all($required[]; . as $rule | [$checks[] | select(.counts and .name == $rule.context and (($rule.integration_id // 0) <= 0 or .app == $rule.integration_id))] | length > 0 and all(.[]; .state == "success"))
     ' <<< "$checks" >/dev/null; then break; fi
     now=$(date +%s)
-    # A dispatched run that is running ends by its own timeout-minutes, so build-minutes never cuts one off:
-    # MR 2026-11-25, run 45568848156, held passed findings when Build tests grew past 15 min (#873).
+    # A dispatched run that is running ends by its own timeout-minutes, so build-minutes never cuts one off,
+    # nor the pass that reads the status its success just posted: MR 2026-11-25, runs 45568848156 and
+    # 45574644160, held passed findings when Build tests grew past 15 min (#873).
     [ "$now" -lt "$deadline" ] || [ "$running" = true ] || stop "checks still pending for $sha after $BUILD_MINUTES min"
     # GitHub occasionally drops the push webhook to Vercel (~1%); Vercel posts pending within seconds when it arrives.
     if [ "$repushed" = false ] && [ "$now" -ge "$repush_at" ] && jq -e 'any(.[]; .context == "Vercel")' <<< "$ruled" >/dev/null && ! jq -e 'any(.[]; .name == "Vercel")' <<< "$checks" >/dev/null; then
