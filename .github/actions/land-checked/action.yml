@@ -10,7 +10,7 @@ inputs:
     description: Newline-separated existing workflows to dispatch on each exact land commit. Each passed job named as a required context of main is reported as a commit status, since GitHub counts no dispatched check run toward a ruleset. Missing owners fail closed.
     default: ""
   build-minutes:
-    description: Longest wait for checks on one commit.
+    description: Longest wait for checks on one commit. A dispatched check-workflows run that has started is waited for until it concludes; its own timeout-minutes bounds it.
     default: "15"
   rounds:
     description: Commits to try, rebasing onto main each time main moved during one.

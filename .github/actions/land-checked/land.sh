@@ -50,10 +50,11 @@ for round in $(seq "$ROUNDS"); do
       stop "a check failed for $sha: $checks"
     fi
     ready=true
+    running=false
     while IFS= read -r workflow_file; do
       [ -z "$workflow_file" ] && continue
-      latest=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$sha&event=workflow_dispatch&per_page=100" --jq '[.workflow_runs[] | select(.head_sha == "'"$sha"'" and .id > '"${dispatched_after[$workflow_file]}"')] | sort_by(.id) | last | "\(.id // 0) \(.conclusion // "pending")"') || stop "reading dispatched $workflow_file failed"
-      read -r run_id dispatched <<< "$latest"
+      latest=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs?head_sha=$sha&event=workflow_dispatch&per_page=100" --jq '[.workflow_runs[] | select(.head_sha == "'"$sha"'" and .id > '"${dispatched_after[$workflow_file]}"')] | sort_by(.id) | last | "\(.id // 0) \(.conclusion // "pending") \(.status // "queued")"') || stop "reading dispatched $workflow_file failed"
+      read -r run_id dispatched run_status <<< "$latest"
       case "$dispatched" in
         success)
           jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" --jq '.jobs[] | select(.conclusion == "success") | "\(.name)\t\(.html_url)"') || stop "reading $workflow_file jobs failed"
@@ -65,7 +66,10 @@ for round in $(seq "$ROUNDS"); do
             ready=false
           done <<< "$jobs"
           ;;
-        pending) ready=false ;;
+        pending)
+          ready=false
+          [ "$run_status" = in_progress ] && running=true
+          ;;
         *) stop "$workflow_file concluded $dispatched for $sha" ;;
       esac
     done <<< "${CHECK_WORKFLOWS:-}"
@@ -74,7 +78,9 @@ for round in $(seq "$ROUNDS"); do
       all($required[]; . as $rule | [$checks[] | select(.counts and .name == $rule.context and (($rule.integration_id // 0) <= 0 or .app == $rule.integration_id))] | length > 0 and all(.[]; .state == "success"))
     ' <<< "$checks" >/dev/null; then break; fi
     now=$(date +%s)
-    [ "$now" -lt "$deadline" ] || stop "checks still pending for $sha after $BUILD_MINUTES min"
+    # A dispatched run that is running ends by its own timeout-minutes, so build-minutes never cuts one off:
+    # MR 2026-11-25, run 45568848156, held passed findings when Build tests grew past 15 min (#873).
+    [ "$now" -lt "$deadline" ] || [ "$running" = true ] || stop "checks still pending for $sha after $BUILD_MINUTES min"
     # GitHub occasionally drops the push webhook to Vercel (~1%); Vercel posts pending within seconds when it arrives.
     if [ "$repushed" = false ] && [ "$now" -ge "$repush_at" ] && jq -e 'any(.[]; .context == "Vercel")' <<< "$ruled" >/dev/null && ! jq -e 'any(.[]; .name == "Vercel")' <<< "$checks" >/dev/null; then
       repushed=true
